@@ -13,12 +13,10 @@ resend>=0.7.0
 # Database
 psycopg2-binary>=2.9.0
 
-# Machine Learning and Time Series Analysis (required for SARIMA forecasting)
-statsmodels>=0.13.0
-scikit-learn>=1.1.0
-pandas>=1.5.0
-numpy>=1.21.0
-joblib>=1.3.0
+# Optional analytics dependencies (SARIMA forecasting and tenant-risk models)
+# are intentionally kept out of the Vercel web runtime.  The portal uses its
+# safe built-in fallbacks when these packages are unavailable.  Install
+# requirements_ml.txt for local model training or analytics work.
 
 # Image handling for ImageField
 Pillow>=9.0.0
