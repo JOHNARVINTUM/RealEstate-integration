@@ -6,6 +6,9 @@
 /.qodo/
 /REALESTATEDEMO_BUILTASUPPLY_INTEGRATION_AUDIT.md
 ~$*.docx
+.env.*
+!.env.example
+!vercel.json
 
 # Python
 __pycache__/
