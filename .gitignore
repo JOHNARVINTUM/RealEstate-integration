@@ -99,3 +99,7 @@ exports/ml/ML_THESIS_EXPLANATION.txt
 # Custom Folders
 skills/
 /.env.local
+
+# This deployment routing file must be versioned even though JSON artifacts
+# above are normally ignored.
+!vercel.json
