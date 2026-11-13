@@ -1,7 +1,9 @@
 {
   "services": {
     "web": {
-      "root": "."
+      "root": ".",
+      "entrypoint": "RealEstateDemo.wsgi:application",
+      "framework": "django"
     }
   },
   "rewrites": [
