@@ -203,7 +203,7 @@
           <div class="mt-4 border-t border-slate-100 pt-4">
             <div class="flex items-baseline justify-between gap-3">
               <span class="text-xs font-black uppercase tracking-wide text-slate-500">Order total</span>
-              <span class="text-base font-black text-slate-900">{{ supply_order.currency }} {{ supply_order.order_total|floatformat:2 }}</span>
+              <span class="text-base font-black text-slate-900">{{ supply_order.currency }} {{ supply_order.order_total|floatformat:2|intcomma }}</span>
             </div>
             <p class="mt-3 text-xs font-black uppercase tracking-wide text-slate-500">Items ordered</p>
             {% if supply_order.order_items %}
@@ -212,8 +212,8 @@
               <li class="p-3 text-sm">
                 <p class="font-bold text-slate-800">{{ item.name }}</p>
                 <div class="mt-1 flex items-center justify-between gap-2 text-xs text-slate-500">
-                  <span>{{ item.quantity }}{% if item.unit_of_measure %} {{ item.unit_of_measure }}{% endif %} × {{ supply_order.currency }} {{ item.unit_price|floatformat:2 }}</span>
-                  <span class="font-bold text-slate-700">{{ supply_order.currency }} {{ item.line_total|floatformat:2 }}</span>
+                  <span>{{ item.quantity }}{% if item.unit_of_measure %} {{ item.unit_of_measure }}{% endif %} × {{ supply_order.currency }} {{ item.unit_price|floatformat:2|intcomma }}</span>
+                  <span class="font-bold text-slate-700">{{ supply_order.currency }} {{ item.line_total|floatformat:2|intcomma }}</span>
                 </div>
               </li>
               {% endfor %}
