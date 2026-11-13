@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+from decimal import Decimal
+
 from django.conf import settings
 from django.db import models
 from rentals.models import Lease, get_user_files_storage
@@ -127,11 +129,35 @@ class MaintenanceSupplyOrder(models.Model):
     maintenance_request = models.OneToOneField(MaintenanceRequest, on_delete=models.CASCADE, related_name="supply_order")
     order_number = models.CharField(max_length=24, unique=True)
     delivery_status = models.CharField(max_length=16, choices=DELIVERY_STATUS_CHOICES, default="UNKNOWN")
+    order_total_minor = models.PositiveBigIntegerField(null=True, blank=True)
+    currency = models.CharField(max_length=3, blank=True, default="")
+    items_snapshot = models.JSONField(default=list, blank=True)
     linked_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="linked_maintenance_supply_orders")
     last_synced_at = models.DateTimeField(null=True, blank=True)
     last_sync_error = models.CharField(max_length=255, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def order_total(self):
+        if self.order_total_minor is None:
+            return None
+        return Decimal(self.order_total_minor) / Decimal("100")
+
+    @property
+    def order_items(self):
+        """Template-ready item snapshot; money is stored as integer minor units."""
+        return [
+            {
+                "name": item.get("name", ""),
+                "quantity": item.get("quantity", 0),
+                "unit_of_measure": item.get("unit_of_measure", ""),
+                "unit_price": Decimal(item.get("unit_price_minor", 0)) / Decimal("100"),
+                "line_total": Decimal(item.get("line_total_minor", 0)) / Decimal("100"),
+            }
+            for item in self.items_snapshot
+            if isinstance(item, dict)
+        ]
 
 
 class MaintenanceCharge(models.Model):

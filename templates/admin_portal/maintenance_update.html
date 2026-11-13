@@ -199,6 +199,30 @@
         <h2 class="text-lg font-black text-slate-900">BUILTASUPPLY delivery</h2>
         {% if supply_order %}
           <p class="mt-2 text-sm font-bold text-slate-700">Order {{ supply_order.order_number }} · {{ supply_order.get_delivery_status_display }}</p>
+          {% if supply_order.order_total != None %}
+          <div class="mt-4 border-t border-slate-100 pt-4">
+            <div class="flex items-baseline justify-between gap-3">
+              <span class="text-xs font-black uppercase tracking-wide text-slate-500">Order total</span>
+              <span class="text-base font-black text-slate-900">{{ supply_order.currency }} {{ supply_order.order_total|floatformat:2 }}</span>
+            </div>
+            <p class="mt-3 text-xs font-black uppercase tracking-wide text-slate-500">Items ordered</p>
+            {% if supply_order.order_items %}
+            <ul class="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-100">
+              {% for item in supply_order.order_items %}
+              <li class="p-3 text-sm">
+                <p class="font-bold text-slate-800">{{ item.name }}</p>
+                <div class="mt-1 flex items-center justify-between gap-2 text-xs text-slate-500">
+                  <span>{{ item.quantity }}{% if item.unit_of_measure %} {{ item.unit_of_measure }}{% endif %} × {{ supply_order.currency }} {{ item.unit_price|floatformat:2 }}</span>
+                  <span class="font-bold text-slate-700">{{ supply_order.currency }} {{ item.line_total|floatformat:2 }}</span>
+                </div>
+              </li>
+              {% endfor %}
+            </ul>
+            {% else %}
+            <p class="mt-2 text-xs text-slate-500">No item details were returned for this order.</p>
+            {% endif %}
+          </div>
+          {% endif %}
           {% if supply_order.last_synced_at %}<p class="mt-1 text-xs text-slate-500">Last refreshed {{ supply_order.last_synced_at|date:"M d, Y h:i A" }}</p>{% endif %}
           {% if supply_order.last_sync_error %}<p class="mt-2 text-xs font-bold text-amber-700">{{ supply_order.last_sync_error }}</p>{% endif %}
           {% if can_link_supply_order %}<form method="post" action="{% url 'admin_refresh_maintenance_supply_order' req.id %}" class="mt-3">{% csrf_token %}<button type="submit" class="text-sm font-extrabold text-indigo-700 hover:text-indigo-900">Refresh delivery status</button></form>{% endif %}
