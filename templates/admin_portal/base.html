@@ -1,0 +1,114 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}Admin Portal{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="{% static 'img/logo.svg' %}">
+  <link rel="shortcut icon" href="{% static 'img/logo.svg' %}">
+
+  <link href="https://fonts.googleapis.com/css2?family=MuseoModerno:ital,wght@0,100..900;1,100..900&family=Outfit:wght@100..900&family=Poppins:wght@300;400;500;600;700;800&display=swap"
+    rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Outfit', 'sans-serif'],
+            display: ['MuseoModerno', 'sans-serif'],
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="{% static 'admin_portal/css/admin.css' %}?v={% now 'U' %}">
+  <link rel="stylesheet" href="{% static 'css/ux-system.css' %}?v={% now 'U' %}">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+
+  {% block extra_head %}{% endblock %}
+</head>
+
+<body>
+  <div class="min-h-screen flex font-['Outfit',_sans-serif]">
+    <!-- Mobile Header -->
+    <div class="mobile-nav-header">
+      <a href="{% url 'admin_dashboard' %}" aria-label="Go to dashboard" class="flex items-center gap-3 rounded-xl focus:outline-none">
+        <div class="brand-logo-shell w-9 h-9 bg-white rounded-xl flex justify-center items-center shrink-0 shadow-sm p-1.5">
+          <img src="{% static 'img/accounts/RealEstate360+ Logo2 jpg.jpg' %}" alt="Logo" class="w-full h-full object-contain">
+        </div>
+        <span class="text-white font-display font-semibold text-lg">RealEstate360<span class="text-blue-500">+</span></span>
+      </a>
+      <button id="mobileSidebarToggle" class="p-2 text-white hover:bg-blue-900/50 rounded-lg transition-colors">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Mobile Overlay -->
+    <div class="mobile-sidebar-overlay" id="mobileOverlay"></div>
+
+    {% include "admin_portal/includes/sidebar.html" %}
+
+    <main class="flex-1 px-4 py-6">
+      <div class="content-shell">
+        {% include "partials/toasts.html" %}
+
+        {% block content %}{% endblock %}
+      </div>
+    </main>
+  </div>
+
+  {% include "partials/loader.html" %}
+
+  <div id="confirmModal" aria-hidden="true" class="font-sans">
+    <div class="modal-overlay" aria-hidden="true"></div>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+      <div class="modal-header">
+        <div class="modal-icon">
+          <svg class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+          </svg>
+        </div>
+        <h3 id="confirmTitle">Confirm action</h3>
+      </div>
+      <p class="confirm-message">Are you sure?</p>
+      <div class="confirm-loading" aria-hidden="true">
+        <p class="confirm-loading-label">Loading...</p>
+        <div class="confirm-loading-progress">
+          <span></span>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn confirm-yes" type="button">Confirm</button>
+        <button class="btn confirm-no" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="{% static 'admin_portal/js/admin-actions.js' %}?v={% now 'U' %}"></script>
+  <script src="{% static 'js/form-guard.js' %}"></script>
+  <script src="{% static 'js/form-validation.js' %}"></script>
+  <script src="{% static 'js/ux-loader.js' %}?v={% now 'U' %}"></script>
+  <script src="{% static 'js/toast-system.js' %}"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <script>
+    (function () {
+      try {
+        flatpickr('.flatpickr', {
+          dateFormat: 'Y-m-d',
+          allowInput: true,
+        });
+      } catch (e) {
+        console.warn('flatpickr init failed', e);
+      }
+    })();
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+
+</html>

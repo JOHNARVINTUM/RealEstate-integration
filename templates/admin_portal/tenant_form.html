@@ -1,0 +1,196 @@
+{% extends "admin_portal/base.html" %}
+{% load humanize %}
+{% load static %}
+
+{% block title %}{{ title|default:"Tenant Registration" }} | Core Administration{% endblock %}
+
+{% block content %}
+<div class="tenant-form-wrapper max-w-7xl mx-auto font-sans text-slate-900 space-y-6 pb-12">
+  
+  <!-- Navigation: Simple Back Button -->
+  <nav class="flex items-center">
+    <a href="{{ back_url|default:'/admin-portal/tenants/' }}" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-xs group">
+      <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+      </svg>
+      <span>Back</span>
+    </a>
+  </nav>
+
+  <div class="flex flex-col lg:flex-row gap-8 items-start">
+    
+    <!-- Left Workspace Column: Main Studio Form -->
+    <div class="flex-1 w-full space-y-6">
+      
+      <!-- Form Header -->
+      <header class="bg-white border border-slate-200 rounded-2xl p-6 lg:p-8 shadow-sm flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6 relative overflow-hidden">
+        <div class="relative z-10">
+          <div class="flex items-center gap-3 mb-2">
+            <div class="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-700 shadow-sm border border-slate-200">
+              <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"></path></svg>
+            </div>
+            <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 leading-tight">{{ title|default:"Add New Tenant" }}</h1>
+          </div>
+          <p class="text-sm text-slate-500 mt-1 pl-13 ml-1">
+            Enter the details for the new tenant below. Account access will be set up automatically.
+          </p>
+        </div>
+      </header>
+
+      <!-- Main Unified Form Card -->
+      <form method="post" enctype="multipart/form-data" class="bg-white border border-slate-200 rounded-xl shadow-xs overflow-visible divide-y divide-slate-100">
+        {% csrf_token %}
+        
+        <!-- Section 1: Identity & Personal Details -->
+        <div class="p-6 sm:p-8 space-y-5">
+          <div class="flex items-center gap-3 pb-3 border-b border-slate-100">
+            <span class="flex items-center justify-center w-6 h-6 rounded-md bg-slate-100 text-slate-800 font-extrabold text-sm">1</span>
+            <h3 class="text-xl font-extrabold text-slate-900 tracking-tight">Identity</h3>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div>
+              <label class="block text-sm font-bold text-slate-800 mb-2 uppercase tracking-wider">First Name <span class="text-rose-600">*</span></label>
+              <input type="text" name="first_name" value="{{ form.first_name.value|default:'' }}" 
+                     class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all outline-none placeholder:text-slate-400 hover:border-slate-400 shadow-sm" 
+                     placeholder="e.g. Alice" required>
+              {% if form.first_name.errors %}
+                <p class="text-sm font-bold text-rose-600 mt-2">{{ form.first_name.errors.0 }}</p>
+              {% endif %}
+            </div>
+
+            <div>
+              <label class="block text-sm font-bold text-slate-800 mb-2 uppercase tracking-wider">Last Name <span class="text-rose-600">*</span></label>
+              <input type="text" name="last_name" value="{{ form.last_name.value|default:'' }}" 
+                     class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all outline-none placeholder:text-slate-400 hover:border-slate-400 shadow-sm" 
+                     placeholder="e.g. Brown" required>
+              {% if form.last_name.errors %}
+                <p class="text-sm font-bold text-rose-600 mt-2">{{ form.last_name.errors.0 }}</p>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 2: Contact & Authentication Credentials -->
+        <div class="p-6 sm:p-8 space-y-5 bg-slate-50/30">
+          <div class="flex items-center gap-3 pb-3 border-b border-slate-100">
+            <span class="flex items-center justify-center w-6 h-6 rounded-md bg-slate-100 text-slate-800 font-extrabold text-sm">2</span>
+            <h3 class="text-xl font-extrabold text-slate-900 tracking-tight">Contact Information</h3>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div>
+              <label class="block text-sm font-bold text-slate-800 mb-2 uppercase tracking-wider">
+                <div class="relative group/tooltip inline-block">
+                  <span class="cursor-help inline-block border-b border-dashed border-slate-300">Email</span>
+                  <div class="absolute bottom-full left-0 mb-2 w-max max-w-[200px] px-3 py-1.5 bg-slate-900 text-white rounded-lg shadow-xl text-xs font-bold opacity-0 invisible group-hover/tooltip:opacity-100 group-hover/tooltip:visible transition-all duration-300 z-50 pointer-events-none border border-slate-700 whitespace-normal text-center delay-[150ms]">
+                    <strong class="block text-indigo-400 mb-1">Note</strong>
+                    This will be used for their login.
+                    <div class="absolute top-full left-8 -translate-x-1/2 border-[5px] border-transparent border-t-slate-900"></div>
+                  </div>
+                </div> <span class="text-rose-600">*</span>
+              </label>
+              <input type="email" name="email" value="{{ form.email.value|default:'' }}" 
+                     class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all outline-none placeholder:text-slate-400 hover:border-slate-400 shadow-sm" 
+                     placeholder="e.g. alice@gmail.com" required>
+              {% if form.email.errors %}
+                <p class="text-sm font-bold text-rose-600 mt-2">{{ form.email.errors.0 }}</p>
+              {% endif %}
+            </div>
+
+            <div>
+              <label class="block text-sm font-bold text-slate-800 mb-2 uppercase tracking-wider">
+                <div class="relative group/tooltip inline-block">
+                  <span class="cursor-help inline-block border-b border-dashed border-slate-300">Phone Number</span>
+                  <div class="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-max px-3 py-1.5 bg-slate-900 text-white rounded-lg shadow-xl text-xs font-bold opacity-0 invisible group-hover/tooltip:opacity-100 group-hover/tooltip:visible transition-all duration-300 z-50 pointer-events-none border border-slate-700 delay-[150ms]">
+                    <strong class="text-indigo-400 mr-1">Note:</strong>Optional.
+                    <div class="absolute top-full left-1/2 -translate-x-1/2 border-[5px] border-transparent border-t-slate-900"></div>
+                  </div>
+                </div>
+              </label>
+              <input type="text" name="contact_no" value="{{ form.contact_no.value|default:'' }}" 
+                     class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all outline-none placeholder:text-slate-400 hover:border-slate-400 shadow-sm" 
+                     placeholder="e.g. 09123456789">
+              {% if form.contact_no.errors %}
+                <p class="text-sm font-bold text-rose-600 mt-2">{{ form.contact_no.errors.0 }}</p>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 3: Documents -->
+        <div class="p-6 sm:p-8 space-y-6">
+          <div class="flex items-center gap-3 pb-3 border-b border-slate-100">
+            <span class="flex items-center justify-center w-6 h-6 rounded-md bg-slate-100 text-slate-800 font-extrabold text-sm">3</span>
+            <h3 class="text-xl font-extrabold text-slate-900 tracking-tight">Documents</h3>
+          </div>
+
+          <div class="space-y-5">
+            <!-- Lease Contract Attachment -->
+            <div class="p-5 rounded-xl border border-slate-200 bg-white shadow-2xs space-y-4">
+              <span class="text-sm font-extrabold text-slate-800 block uppercase tracking-wider">Lease Agreement</span>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label for="contract_file" class="block text-xs font-bold text-slate-600 mb-2 uppercase tracking-wider">Upload Contract</label>
+                  <p id="contract_file_help" class="text-xs text-slate-500 mb-2">Accepted formats: PDF, DOC, DOCX, PNG, JPG, JPEG. Maximum size: 10 MB.</p>
+                  <input id="contract_file" type="file" name="contract_file" data-tenant-document-upload data-feedback-id="contract_file_error" aria-describedby="contract_file_help contract_file_error" {% if form.contract_file.errors %}aria-invalid="true"{% endif %} accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg"
+                         class="w-full text-base text-slate-700 file:mr-3 file:py-2.5 file:px-4 file:rounded-lg file:border file:border-slate-300 file:text-xs file:font-bold file:bg-slate-50 file:text-slate-800 hover:file:bg-slate-100 transition-colors cursor-pointer border border-slate-300 rounded-lg bg-white shadow-sm hover:border-slate-400">
+                  <p id="contract_file_error" class="mt-2 text-sm font-semibold text-rose-700" role="alert" aria-live="polite" {% if not form.contract_file.errors %}hidden{% endif %}>{% if form.contract_file.errors %}{{ form.contract_file.errors.0 }}{% endif %}</p>
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-2 uppercase tracking-wider">Description</label>
+                  <input type="text" name="contract_description" value="{{ form.contract_description.value|default:'' }}"
+                         class="w-full px-4 py-2.5 bg-white border border-slate-300 rounded-lg text-sm font-medium text-slate-900 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all hover:border-slate-400 shadow-sm" 
+                         placeholder="e.g. Contract, Agreement">
+                </div>
+              </div>
+            </div>
+
+            <!-- Valid Identification Upload -->
+            <div class="p-5 rounded-xl border border-slate-200 bg-white shadow-2xs space-y-4">
+              <span class="text-sm font-extrabold text-slate-800 block uppercase tracking-wider">Valid ID</span>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label for="valid_id_file" class="block text-xs font-bold text-slate-600 mb-2 uppercase tracking-wider">Upload Valid ID</label>
+                  <p id="valid_id_file_help" class="text-xs text-slate-500 mb-2">Accepted formats: PDF, DOC, DOCX, PNG, JPG, JPEG. Maximum size: 10 MB.</p>
+                  <input id="valid_id_file" type="file" name="valid_id_file" data-tenant-document-upload data-feedback-id="valid_id_file_error" aria-describedby="valid_id_file_help valid_id_file_error" {% if form.valid_id_file.errors %}aria-invalid="true"{% endif %} accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg"
+                         class="w-full text-base text-slate-700 file:mr-3 file:py-2.5 file:px-4 file:rounded-lg file:border file:border-slate-300 file:text-xs file:font-bold file:bg-slate-50 file:text-slate-800 hover:file:bg-slate-100 transition-colors cursor-pointer border border-slate-300 rounded-lg bg-white shadow-sm hover:border-slate-400">
+                  <p id="valid_id_file_error" class="mt-2 text-sm font-semibold text-rose-700" role="alert" aria-live="polite" {% if not form.valid_id_file.errors %}hidden{% endif %}>{% if form.valid_id_file.errors %}{{ form.valid_id_file.errors.0 }}{% endif %}</p>
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-2 uppercase tracking-wider">Description</label>
+                  <input type="text" name="valid_id_description" value="{{ form.valid_id_description.value|default:'' }}"
+                         class="w-full px-4 py-2.5 bg-white border border-slate-300 rounded-lg text-sm font-medium text-slate-900 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all hover:border-slate-400 shadow-sm" 
+                         placeholder="e.g. Driver's License">
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Form Submission Controls -->
+        <div class="p-6 bg-slate-50 flex flex-col sm:flex-row items-center gap-3 justify-end rounded-b-xl">
+          <a href="{{ back_url|default:'/admin-portal/tenants/' }}" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-xs group">
+      <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+      </svg>
+      <span>Back</span>
+    </a>
+          <button type="submit" class="w-full sm:w-auto px-8 py-3 bg-slate-800 hover:bg-slate-900 text-white rounded-lg font-extrabold text-base transition-colors text-center shadow-xs">
+            Add Tenant
+          </button>
+        </div>
+
+      </form>
+
+    </div>
+
+    <!-- Right Column removed per user request (Registry Feed Snapshot and Storage Mapping) -->
+
+  </div>
+
+  </div>
+
+</div>
+<script src="{% static 'js/tenant-upload-validation.js' %}" defer></script>
+{% endblock %}

@@ -1,0 +1,276 @@
+{% extends "admin_portal/base.html" %}
+{% load humanize %}
+{% block title %}Tenants Directory | Core Administration{% endblock %}
+
+{% block content %}
+<div class="tenants-wrapper max-w-7xl mx-auto font-sans text-slate-900 space-y-8 pb-12">
+  
+  <!-- Header Section -->
+  <header class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+    <div>
+      <div class="flex items-center gap-2 mb-1">
+        <span class="inline-block w-3 h-3 rounded-full bg-blue-600"></span>
+        <span class="text-sm font-semibold text-slate-700">Manage Tenants</span>
+      </div>
+      <h1 class="text-3xl md:text-4xl font-extrabold tracking-tight text-slate-900">Tenants</h1>
+      <p class="text-base text-slate-700 mt-1 leading-relaxed">Find and manage all your tenants in one place.</p>
+    </div>
+    
+    <div class="shrink-0 w-full sm:w-auto">
+      <a href="{% url 'admin_create_tenant_profile' %}" class="inline-flex items-center gap-2 w-full sm:w-auto justify-center px-5 py-3 bg-slate-800 hover:bg-slate-900 text-white rounded-lg text-sm font-extrabold transition-colors shadow-xs">
+        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path>
+        </svg>
+        <span>Add New Tenant</span>
+      </a>
+    </div>
+  </header>
+
+  <!-- Metrics Statistics Row -->
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-5">
+    
+    <!-- Total Profiles Card -->
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-blue-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-sm font-bold text-slate-700 block mb-1">All Tenants</span>
+        <div class="text-3xl font-black text-slate-900 tracking-tight">{{ total_tenants_count|intcomma }}</div>
+      </div>
+      <div class="text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-blue-600 font-bold">●</span> Cumulative registered accounts
+      </div>
+    </div>
+
+    <!-- Active Leases Card -->
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-emerald-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-sm font-bold text-slate-700 block mb-1">Active Rooms</span>
+        <div class="text-3xl font-black text-slate-900 tracking-tight">{{ active_tenants_count|intcomma }}</div>
+      </div>
+      <div class="text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-emerald-600 font-bold">●</span> Compliant leasing records
+      </div>
+    </div>
+
+    <!-- New Registrations Card -->
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-amber-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-sm font-bold text-slate-700 block mb-1">New Tenants</span>
+        <div class="text-3xl font-black text-slate-900 tracking-tight">{{ new_tenants_count|intcomma }}</div>
+      </div>
+      <div class="text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-amber-600 font-bold">●</span> Pending full background intake
+      </div>
+    </div>
+
+  </section>
+
+  <!-- Table Container Workspace -->
+  <div class="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
+    
+    <!-- Top Filter & Search Bar -->
+    <div class="p-5 border-b border-slate-200 bg-slate-50/50 flex flex-col sm:flex-row justify-between items-stretch sm:items-center gap-4">
+      
+      <div class="w-full sm:w-96">
+        <form method="get" class="relative flex items-center">
+          <div class="absolute left-3.5 text-slate-500">
+            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+            </svg>
+          </div>
+          <input type="text" name="q" value="{{ q }}" placeholder="Search by name, email, or contact number..." 
+                 class="w-full pl-11 pr-20 py-2.5 bg-white border border-slate-300 rounded-lg text-sm font-medium text-slate-900 focus:ring-2 focus:ring-slate-500 focus:border-slate-500 outline-none transition-all placeholder:text-slate-400">
+          {% if q %}
+            <a href="{% url 'admin_tenants' %}" class="absolute right-3.5 text-xs font-bold text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 px-2.5 py-1 rounded transition-colors">
+              Clear
+            </a>
+          {% endif %}
+          <button type="submit" class="hidden">Search</button>
+        </form>
+      </div>
+
+      <div class="flex items-center justify-between sm:justify-end gap-3 shrink-0 flex-wrap">
+        <!-- Lease Status Filter -->
+        <div class="flex items-center gap-1.5">
+          <span class="text-xs font-bold text-slate-500 mr-1">Lease:</span>
+          <a href="?{% if q %}q={{ q }}&{% endif %}lease=" 
+             class="px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors {% if not lease_filter %}bg-slate-800 text-white border-slate-800{% else %}bg-white text-slate-700 border-slate-300 hover:bg-slate-100{% endif %}">
+            All
+          </a>
+          <a href="?{% if q %}q={{ q }}&{% endif %}lease=active" 
+             class="px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors {% if lease_filter == 'active' %}bg-emerald-700 text-white border-emerald-700{% else %}bg-white text-slate-700 border-slate-300 hover:bg-slate-100{% endif %}">
+            Active Lease
+          </a>
+          <a href="?{% if q %}q={{ q }}&{% endif %}lease=pending"
+             class="px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors {% if lease_filter == 'pending' %}bg-sky-700 text-white border-sky-700{% else %}bg-white text-slate-700 border-slate-300 hover:bg-slate-100{% endif %}">
+            Awaiting Move-in
+          </a>
+          <a href="?{% if q %}q={{ q }}&{% endif %}lease=none" 
+             class="px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors {% if lease_filter == 'none' %}bg-rose-700 text-white border-rose-700{% else %}bg-white text-slate-700 border-slate-300 hover:bg-slate-100{% endif %}">
+            No Lease
+          </a>
+        </div>
+        <div class="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border border-slate-200 shadow-xs">
+          <span class="text-sm font-black text-slate-900">{{ page_obj.paginator.count }}</span>
+          <span class="text-xs font-bold text-slate-600">Total Entries</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Data Grid Table -->
+    <div class="overflow-x-auto custom-scrollbar">
+      <table class="w-full text-left border-collapse min-w-[900px]">
+        <thead>
+          <tr class="bg-slate-100 border-b border-slate-200">
+            <th class="px-6 py-4 text-xs font-extrabold text-slate-700 uppercase tracking-wider">Tenant</th>
+            <th class="px-6 py-4 text-xs font-extrabold text-slate-700 uppercase tracking-wider">Contact Info</th>
+            <th class="px-6 py-4 text-xs font-extrabold text-slate-700 uppercase tracking-wider">Status</th>
+            <th class="px-6 py-4 text-xs font-extrabold text-slate-700 uppercase tracking-wider text-right">Actions</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-200">
+          {% for t in page_obj %}
+            <tr class="hover:bg-slate-50 transition-colors group">
+              
+              <!-- Tenant Identity -->
+              <td class="px-6 py-4">
+                <div class="flex items-center gap-3.5">
+                  <div class="shrink-0 w-12 h-12 rounded-xl bg-slate-100 border border-slate-300 flex items-center justify-center text-slate-800 font-extrabold text-base shadow-xs group-hover:bg-slate-800 group-hover:text-white transition-colors">
+                    {{ t.first_name|first }}{{ t.last_name|first }}
+                  </div>
+                  <div>
+                    <div class="text-base font-extrabold text-slate-900 tracking-tight">{{ t.first_name }} {{ t.last_name }}</div>
+                    <div class="text-xs font-bold text-slate-500 mt-0.5">Ref: #{{ t.id|stringformat:"04d" }}</div>
+                  </div>
+                </div>
+              </td>
+
+              <!-- Contact Protocols -->
+              <td class="px-6 py-4">
+                <div class="text-sm font-bold text-slate-800">{{ t.user.email }}</div>
+                <div class="text-xs font-semibold text-slate-600 mt-1 flex items-center gap-1">
+                  <svg class="w-3.5 h-3.5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"></path>
+                  </svg>
+                  <span>{{ t.contact_no|default:"Unverified" }}</span>
+                </div>
+              </td>
+
+              <!-- Account Standing -->
+              <td class="px-6 py-4">
+                <div class="flex flex-col gap-1.5">
+                  <span class="inline-flex items-center gap-2 px-3 py-1 rounded-md text-xs font-bold {% if t.user.is_active %}bg-emerald-50 text-emerald-800 border border-emerald-200{% else %}bg-slate-100 text-slate-600 border border-slate-300{% endif %}">
+                    <span class="w-2 h-2 rounded-full {% if t.user.is_active %}bg-emerald-600{% else %}bg-slate-400{% endif %}"></span>
+                    {% if t.user.is_active %}Active Account{% else %}Suspended{% endif %}
+                  </span>
+                  {% if t.has_active_lease %}
+                    <span class="inline-flex items-center gap-2 px-3 py-1 rounded-md text-xs font-bold bg-blue-50 text-blue-800 border border-blue-200">
+                      <span class="w-2 h-2 rounded-full bg-blue-600"></span>
+                      Active Lease
+                    </span>
+                  {% elif t.has_pending_move_in %}
+                    <span class="inline-flex items-center gap-2 px-3 py-1 rounded-md text-xs font-bold bg-sky-50 text-sky-800 border border-sky-200">
+                      <span class="w-2 h-2 rounded-full bg-sky-600"></span>
+                      Awaiting Move-in
+                    </span>
+                  {% else %}
+                    <span class="inline-flex items-center gap-2 px-3 py-1 rounded-md text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200">
+                      <span class="w-2 h-2 rounded-full bg-rose-400"></span>
+                      No Lease
+                    </span>
+                  {% endif %}
+                </div>
+              </td>
+
+              <!-- Administrative Actions -->
+              <td class="px-6 py-4 text-right">
+                <div class="flex justify-end items-center gap-2">
+                  <a href="{% url 'admin_tenant_detail' t.id %}?next={{ request.get_full_path|urlencode }}" class="inline-flex items-center gap-1 px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 rounded-lg text-xs font-bold transition-colors shadow-xs" title="View Profile Detail">
+                    <svg class="w-4 h-4 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+                    </svg>
+                    <span>View</span>
+                  </a>
+                  
+                  <a href="{% url 'admin_edit_tenant' t.id %}" class="inline-flex items-center gap-1 px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 rounded-lg text-xs font-bold transition-colors shadow-xs" title="Modify Credentials">
+                    <svg class="w-4 h-4 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
+                    </svg>
+                    <span>Edit</span>
+                  </a>
+                  
+                </div>
+              </td>
+
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="4" class="py-16 text-center bg-slate-50/50">
+                <div class="max-w-sm mx-auto flex flex-col items-center">
+                  <div class="w-16 h-16 bg-white border border-slate-200 rounded-full flex items-center justify-center text-slate-400 mb-4 shadow-xs">
+                    <svg class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                    </svg>
+                  </div>
+                  <h3 class="text-base font-extrabold text-slate-900">No Tenants Found</h3>
+                  <p class="text-sm text-slate-600 mt-1 leading-relaxed">Try a different search or add a new tenant.</p>
+                  <a href="{% url 'admin_create_tenant_profile' %}" class="mt-5 inline-flex items-center gap-2 px-4 py-2.5 bg-slate-800 hover:bg-slate-900 text-white rounded-lg text-xs font-extrabold transition-colors shadow-xs">
+                    + Intake Tenant Profile
+                  </a>
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Pagination Footer -->
+    {% if page_obj.paginator.num_pages > 1 %}
+      <div class="p-5 bg-slate-50 border-t border-slate-200 flex flex-col md:flex-row justify-between items-center gap-4">
+        <div class="flex items-center text-[10px] sm:text-xs text-slate-700 font-bold whitespace-nowrap leading-none mb-1 md:mb-0">
+          <span>Showing <strong class="text-slate-900 font-black">{{ page_obj.start_index }}-{{ page_obj.end_index }}</strong> of <strong class="text-slate-900 font-black">{{ page_obj.paginator.count }}</strong> profiles</span>
+        </div>
+        
+        <div class="flex flex-wrap md:flex-nowrap items-center justify-center md:justify-end gap-1 sm:gap-1.5">
+          {% if page_obj.has_previous %}
+            <a href="?page=1{% if q %}&q={{ q }}{% endif %}{% if lease_filter %}&lease={{ lease_filter }}{% endif %}" 
+               class="inline-flex items-center whitespace-nowrap px-2 py-1 sm:px-2.5 sm:py-1.5 bg-white border border-slate-300 rounded text-xs font-bold text-slate-700 hover:bg-slate-100 transition-colors" title="First Page">
+              &laquo;&nbsp;First
+            </a>
+            <a href="?page={{ page_obj.previous_page_number }}{% if q %}&q={{ q }}{% endif %}{% if lease_filter %}&lease={{ lease_filter }}{% endif %}" 
+               class="inline-flex items-center whitespace-nowrap px-2 py-1 sm:px-2.5 sm:py-1.5 bg-white border border-slate-300 rounded text-xs font-bold text-slate-700 hover:bg-slate-100 transition-colors" title="Previous Page">
+              &lsaquo;&nbsp;Prev
+            </a>
+          {% endif %}
+
+          <div class="flex items-center gap-1">
+            {% for num in page_obj.paginator.page_range %}
+              {% if page_obj.number == num %}
+                <span class="inline-flex items-center justify-center min-w-[28px] px-2 py-1 sm:px-3 sm:py-1.5 rounded bg-slate-800 text-white text-xs font-extrabold select-none shadow-sm">{{ num }}</span>
+              {% elif num > page_obj.number|add:'-3' and num < page_obj.number|add:'3' %}
+                <a href="?page={{ num }}{% if q %}&q={{ q }}{% endif %}{% if lease_filter %}&lease={{ lease_filter }}{% endif %}" 
+                   class="inline-flex items-center justify-center min-w-[28px] px-2 py-1 sm:px-3 sm:py-1.5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs font-bold transition-colors">{{ num }}</a>
+              {% endif %}
+            {% endfor %}
+          </div>
+
+          {% if page_obj.has_next %}
+            <a href="?page={{ page_obj.next_page_number }}{% if q %}&q={{ q }}{% endif %}{% if lease_filter %}&lease={{ lease_filter }}{% endif %}" 
+               class="inline-flex items-center whitespace-nowrap px-2 py-1 sm:px-2.5 sm:py-1.5 bg-white border border-slate-300 rounded text-xs font-bold text-slate-700 hover:bg-slate-100 transition-colors" title="Next Page">
+              Next&nbsp;&rsaquo;
+            </a>
+            <a href="?page={{ page_obj.paginator.num_pages }}{% if q %}&q={{ q }}{% endif %}{% if lease_filter %}&lease={{ lease_filter }}{% endif %}" 
+               class="inline-flex items-center whitespace-nowrap px-2 py-1 sm:px-2.5 sm:py-1.5 bg-white border border-slate-300 rounded text-xs font-bold text-slate-700 hover:bg-slate-100 transition-colors" title="Last Page">
+              Last&nbsp;&raquo;
+            </a>
+          {% endif %}
+        </div>
+      </div>
+    {% endif %}
+
+  </div>
+
+</div>
+{% endblock %}

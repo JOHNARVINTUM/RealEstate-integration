@@ -1,0 +1,335 @@
+{% extends "admin_portal/base.html" %}
+{% load static %}
+{% load humanize %}
+
+{% block title %}Edit Profile: {{ tenant.full_name }} - RealEstate360+{% endblock %}
+
+{% block content %}
+<div class="tenant-edit-wrapper max-w-7xl mx-auto font-sans text-slate-900 space-y-6 pb-12">
+  
+  <!-- Navigation: Simple Back Button -->
+  <nav class="flex items-center">
+    <a href="{{ back_url|default:'/admin-portal/tenants/' }}" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-xs group">
+      <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+      </svg>
+      <span>Back</span>
+    </a>
+  </nav>
+
+  <div class="flex flex-col lg:flex-row gap-8 items-start">
+    
+    <!-- Left Workspace Column: Edit Form Workspace -->
+    <div class="flex-1 w-full space-y-6">
+      
+      <!-- Form Header -->
+      <header class="bg-white border border-slate-200 rounded-2xl p-6 lg:p-8 shadow-sm flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6 relative overflow-hidden">
+        <div class="relative z-10">
+          <div class="flex items-center gap-3 mb-2">
+            <div class="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-700 shadow-sm border border-slate-200">
+              <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>
+            </div>
+            <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 leading-tight">Edit Profile</h1>
+          </div>
+          <p class="text-sm text-slate-500 mt-1 pl-13 ml-1">
+            Update the account information and personal details for <strong class="text-slate-900">{{ tenant.full_name }}</strong>.
+          </p>
+        </div>
+      </header>
+
+      <!-- Main Consolidated Edit Form -->
+      <form method="post" enctype="multipart/form-data" class="space-y-6">
+        {% csrf_token %}
+        
+        <!-- Section 1: Account Identification & Access Scope -->
+        <div class="bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md transition-shadow p-6 sm:p-8 space-y-6">
+          <div class="flex items-center gap-4 pb-4 border-b border-slate-100">
+            <span class="flex items-center justify-center w-8 h-8 rounded-lg bg-indigo-50 text-indigo-700 font-black text-sm border border-indigo-100">1</span>
+            <h3 class="text-xl font-black text-slate-900 tracking-tight">Account Info</h3>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div>
+              <label class="block text-xs font-black text-slate-500 mb-2 uppercase tracking-widest">Email Address <span class="text-rose-600">*</span></label>
+              <input type="email" name="email" value="{{ form.email.value|default:'' }}" 
+                     class="w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl text-base font-bold text-slate-900 focus:bg-white focus:border-indigo-500 transition-all outline-none" required>
+              {% if form.email.errors %}
+                <p class="text-sm font-bold text-rose-600 mt-2">{{ form.email.errors.0 }}</p>
+              {% endif %}
+            </div>
+
+            <div>
+              <label class="block text-xs font-black text-slate-500 mb-2 uppercase tracking-widest">Username <span class="text-rose-600">*</span></label>
+              <input type="text" name="username" value="{{ form.username.value|default:'' }}" 
+                     class="w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl text-base font-bold text-slate-900 focus:bg-white focus:border-indigo-500 transition-all outline-none" required>
+            </div>
+
+            <div>
+              <label class="block text-xs font-black text-slate-500 mb-2 uppercase tracking-widest">Role</label>
+               <select name="role" class="w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl text-base font-bold text-slate-900 focus:bg-white focus:border-indigo-500 transition-all outline-none cursor-pointer appearance-none">
+                {% for value, label in form.fields.role.choices %}
+                  <option value="{{ value }}" {% if form.role.value == value %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+
+            <div class="flex items-center pt-2 sm:pt-6">
+              <label class="inline-flex items-center gap-3 cursor-pointer">
+                <input type="checkbox" name="is_active" class="w-5 h-5 rounded border-slate-300 text-slate-800 focus:ring-slate-500 cursor-pointer" {% if form.is_active.value %}checked{% endif %}>
+                <span class="text-sm font-extrabold text-slate-800 select-none uppercase tracking-wider">Active Account</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 2: Core Personal Details -->
+        <div class="bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md transition-shadow p-6 sm:p-8 space-y-6">
+          <div class="flex items-center gap-4 pb-4 border-b border-slate-100">
+            <span class="flex items-center justify-center w-8 h-8 rounded-lg bg-emerald-50 text-emerald-700 font-black text-sm border border-emerald-100">2</span>
+            <h3 class="text-xl font-black text-slate-900 tracking-tight">Personal Info</h3>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div>
+              <label class="block text-xs font-black text-slate-500 mb-2 uppercase tracking-widest">First Name <span class="text-rose-600">*</span></label>
+              <input type="text" name="first_name" value="{{ form.first_name.value|default:'' }}" 
+                     class="w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl text-base font-bold text-slate-900 focus:bg-white focus:border-indigo-500 transition-all outline-none" required>
+            </div>
+
+            <div>
+              <label class="block text-xs font-black text-slate-500 mb-2 uppercase tracking-widest">Last Name <span class="text-rose-600">*</span></label>
+              <input type="text" name="last_name" value="{{ form.last_name.value|default:'' }}" 
+                     class="w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl text-base font-bold text-slate-900 focus:bg-white focus:border-indigo-500 transition-all outline-none" required>
+            </div>
+
+            <div class="md:col-span-2">
+              <label class="block text-xs font-black text-slate-500 mb-2 uppercase tracking-widest">Phone Number</label>
+              <input type="text" name="contact_no" value="{{ form.contact_no.value|default:'' }}" 
+                     class="w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl text-base font-bold text-slate-900 focus:bg-white focus:border-indigo-500 transition-all outline-none placeholder:text-slate-400" 
+                     placeholder="+63 9XX XXX XXXX">
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 3: Manual Authentication Protocols -->
+        <div class="bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md transition-shadow p-6 sm:p-8 space-y-6">
+          <div class="flex items-center gap-4 pb-4 border-b border-slate-100">
+            <span class="flex items-center justify-center w-8 h-8 rounded-lg bg-amber-50 text-amber-700 font-black text-sm border border-amber-100">3</span>
+            <h3 class="text-xl font-black text-slate-900 tracking-tight">Change Password</h3>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div>
+              <label class="block text-xs font-black text-slate-500 mb-2 uppercase tracking-widest">
+                <div class="relative group/tooltip inline-block">
+                  <span class="cursor-help inline-block border-b border-dashed border-slate-300">New Password</span>
+                  <div class="absolute bottom-full left-0 mb-2 w-[200px] px-3 py-2 bg-slate-900 text-white rounded-lg shadow-xl text-xs font-medium opacity-0 invisible group-hover/tooltip:opacity-100 group-hover/tooltip:visible transition-all duration-300 z-50 pointer-events-none border border-slate-700 whitespace-normal text-center delay-[150ms]">
+                    <strong class="text-indigo-400">Note:</strong> Leave blank if keeping current password.
+                    <div class="absolute top-full left-10 -translate-x-1/2 border-[5px] border-transparent border-t-slate-900"></div>
+                  </div>
+                </div>
+              </label>
+              <input type="password" name="new_password" 
+                     class="w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl text-base font-bold text-slate-900 focus:bg-white focus:border-indigo-500 transition-all outline-none placeholder:text-slate-300" 
+                     placeholder="••••••••">
+            </div>
+
+            <div>
+              <label class="block text-xs font-black text-slate-500 mb-2 uppercase tracking-widest">
+                <div class="relative group/tooltip inline-block">
+                  <span class="cursor-help inline-block border-b border-dashed border-slate-300">Confirm Password</span>
+                  <div class="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-[200px] px-3 py-2 bg-slate-900 text-white rounded-lg shadow-xl text-xs font-medium opacity-0 invisible group-hover/tooltip:opacity-100 group-hover/tooltip:visible transition-all duration-300 z-50 pointer-events-none border border-slate-700 whitespace-normal text-center delay-[150ms]">
+                    <strong class="text-indigo-400">Note:</strong> Leave blank if keeping current password.
+                    <div class="absolute top-full left-1/2 -translate-x-1/2 border-[5px] border-transparent border-t-slate-900"></div>
+                  </div>
+                </div>
+              </label>
+              <input type="password" name="confirm_password" 
+                     class="w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl text-base font-bold text-slate-900 focus:bg-white focus:border-indigo-500 transition-all outline-none placeholder:text-slate-300" 
+                     placeholder="••••••••">
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 4: Document Updating Integration -->
+        <div class="bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md transition-shadow p-6 sm:p-8 space-y-6">
+          <div class="flex items-center gap-4 pb-4 border-b border-slate-100">
+            <span class="flex items-center justify-center w-8 h-8 rounded-lg bg-rose-50 text-rose-700 font-black text-sm border border-rose-100">4</span>
+            <h3 class="text-xl font-black text-slate-900 tracking-tight">Documents</h3>
+          </div>
+
+          <div class="space-y-6">
+            <!-- Master Lease Instrument Update -->
+            <div class="p-4 rounded-xl border border-slate-200 bg-white shadow-2xs space-y-3">
+              <span class="text-sm font-extrabold text-slate-800 block uppercase tracking-wider">Lease Agreement</span>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label for="contract_file" class="block text-sm font-bold text-slate-600 mb-2 uppercase tracking-wider">Upload New File</label>
+                  <p id="contract_file_help" class="text-xs text-slate-500 mb-2">Accepted formats: PDF, DOC, DOCX, PNG, JPG, JPEG. Maximum size: 10 MB.</p>
+                  <input type="file" id="contract_file" name="contract_file" data-tenant-document-upload data-feedback-id="contract_file_error" aria-describedby="contract_file_help contract_file_error" {% if form.contract_file.errors %}aria-invalid="true"{% endif %} accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg"
+                         class="w-full text-base text-slate-700 file:mr-3 file:py-2 file:px-4 file:rounded-md file:border file:border-slate-300 file:text-sm file:font-bold file:bg-slate-50 file:text-slate-800 hover:file:bg-slate-100 transition-colors cursor-pointer">
+                  <p id="contract_file_error" class="mt-2 text-sm font-semibold text-rose-700" role="alert" aria-live="polite" {% if not form.contract_file.errors %}hidden{% endif %}>{% if form.contract_file.errors %}{{ form.contract_file.errors.0 }}{% endif %}</p>
+
+                  <div id="contract_preview_container" class="mt-3 hidden">
+                    <p class="text-sm font-bold text-slate-600 mb-1">New File Preview:</p>
+                    <img id="contract_preview_img" src="" alt="New Contract Preview" class="w-32 h-32 object-cover rounded-lg border border-slate-300 shadow-sm">
+                  </div>
+
+                  <div class="text-sm text-slate-500 mt-2 font-medium" id="contract_status_area">
+                    Status:
+                    {% if contract_attachments %}
+                      <div class="flex flex-wrap gap-3 mt-3">
+                        {% for att in contract_attachments %}
+                          <a href="{% url 'admin_view_attachment' att.id %}" target="_blank" rel="noopener" class="inline-block" title="Uploaded: {{ att.uploaded_at|date:'M d, Y' }}">
+                            <img src="{% url 'admin_view_attachment' att.id %}" alt="Lease Agreement Preview" class="w-32 h-32 object-cover rounded-lg border border-slate-300 shadow-sm hover:opacity-80 transition-opacity">
+                          </a>
+                        {% endfor %}
+                      </div>
+                    {% else %}
+                      <strong class="text-slate-700">No File Yet</strong>
+                    {% endif %}
+                  </div>
+                </div>
+                <div>
+                  <label class="block text-sm font-bold text-slate-600 mb-2 uppercase tracking-wider">Description</label>
+                  <textarea name="contract_description" rows="2" 
+                            class="w-full px-4 py-3 bg-white border border-slate-300 rounded-md text-base font-medium text-slate-900 outline-none resize-none placeholder:text-slate-400" 
+                            placeholder="Contract specifics or updates...">{{ form.contract_description.value|default:'' }}</textarea>
+                </div>
+              </div>
+            </div>
+
+            <!-- Identity Instrument Update -->
+            <div class="p-4 rounded-xl border border-slate-200 bg-white shadow-2xs space-y-3">
+              <span class="text-sm font-extrabold text-slate-800 block uppercase tracking-wider">Valid ID</span>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label for="valid_id_file" class="block text-sm font-bold text-slate-600 mb-2 uppercase tracking-wider">Upload New File</label>
+                  <p id="valid_id_file_help" class="text-xs text-slate-500 mb-2">Accepted formats: PDF, DOC, DOCX, PNG, JPG, JPEG. Maximum size: 10 MB.</p>
+                  <input type="file" id="valid_id_file" name="valid_id_file" data-tenant-document-upload data-feedback-id="valid_id_file_error" aria-describedby="valid_id_file_help valid_id_file_error" {% if form.valid_id_file.errors %}aria-invalid="true"{% endif %} accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg"
+                         class="w-full text-base text-slate-700 file:mr-3 file:py-2 file:px-4 file:rounded-md file:border file:border-slate-300 file:text-sm file:font-bold file:bg-slate-50 file:text-slate-800 hover:file:bg-slate-100 transition-colors cursor-pointer">
+                  <p id="valid_id_file_error" class="mt-2 text-sm font-semibold text-rose-700" role="alert" aria-live="polite" {% if not form.valid_id_file.errors %}hidden{% endif %}>{% if form.valid_id_file.errors %}{{ form.valid_id_file.errors.0 }}{% endif %}</p>
+
+                  <div id="valid_id_preview_container" class="mt-3 hidden">
+                    <p class="text-sm font-bold text-slate-600 mb-1">New File Preview:</p>
+                    <img id="valid_id_preview_img" src="" alt="New Valid ID Preview" class="w-32 h-32 object-cover rounded-lg border border-slate-300 shadow-sm">
+                  </div>
+
+                  <div class="text-sm text-slate-500 mt-2 font-medium" id="valid_id_status_area">
+                    Status:
+                    {% if valid_id_attachments %}
+                      <div class="flex flex-wrap gap-3 mt-3">
+                        {% for att in valid_id_attachments %}
+                          <a href="{% url 'admin_view_attachment' att.id %}" target="_blank" rel="noopener" class="inline-block" title="Uploaded: {{ att.uploaded_at|date:'M d, Y' }}">
+                            <img src="{% url 'admin_view_attachment' att.id %}" alt="Valid ID Preview" class="w-32 h-32 object-cover rounded-lg border border-slate-300 shadow-sm hover:opacity-80 transition-opacity">
+                          </a>
+                        {% endfor %}
+                      </div>
+                    {% else %}
+                      <strong class="text-slate-700">No File Yet</strong>
+                    {% endif %}
+                  </div>
+                </div>
+                <div>
+                  <label class="block text-sm font-bold text-slate-600 mb-2 uppercase tracking-wider">Description</label>
+                  <textarea name="valid_id_description" rows="2" 
+                            class="w-full px-4 py-3 bg-white border border-slate-300 rounded-md text-base font-medium text-slate-900 outline-none resize-none placeholder:text-slate-400" 
+                            placeholder="e.g. Driver's License, Passport...">{{ form.valid_id_description.value|default:'' }}</textarea>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Form Submission Button Bar -->
+        <div class="flex flex-col sm:flex-row items-center gap-4 justify-end pt-4">
+          <a href="{{ back_url|default:'/admin-portal/tenants/' }}" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center justify-center gap-2 px-6 py-3.5 bg-white border-2 border-slate-200 rounded-xl text-sm font-black text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition-all shadow-sm w-full sm:w-auto">
+            Back
+          </a>
+          <button type="submit" class="w-full sm:w-auto px-8 py-3.5 bg-slate-900 hover:bg-black text-white rounded-xl font-black text-sm tracking-wide transition-all shadow-lg active:scale-95 text-center">
+            Save Changes
+          </button>
+        </div>
+
+      </form>
+
+    </div>
+
+    <!-- Right Side System Administration Column -->
+    <div class="w-full lg:w-[320px] space-y-6 shrink-0 lg:sticky lg:top-6">
+      
+      <!-- Account Overview Panel -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-4">
+        <span class="text-xs font-black text-slate-400 uppercase tracking-widest block pb-4 border-b border-slate-800">
+          Account Status
+        </span>
+        
+        <div class="space-y-4 text-sm font-medium">
+          <div class="flex justify-between items-center">
+            <span class="text-slate-400">Status</span>
+            <strong class="px-3 py-1 rounded-lg text-[11px] font-black uppercase tracking-wider {% if tenant.user.is_active %}bg-emerald-500/20 text-emerald-400 border border-emerald-500/30{% else %}bg-rose-500/20 text-rose-400 border border-rose-500/30{% endif %}">
+              {% if tenant.user.is_active %}Active{% else %}Suspended{% endif %}
+            </strong>
+          </div>
+          <div class="pt-3 border-t border-slate-800 flex justify-between items-center">
+            <span class="text-slate-400">Role</span>
+            <strong class="text-white font-black text-base">{{ tenant.user.get_role_display }}</strong>
+          </div>
+          <div class="pt-3 border-t border-slate-800 flex justify-between items-center">
+            <span class="text-slate-400">Tenant ID</span>
+            <strong class="text-indigo-400 font-mono font-black text-base">#{{ tenant.id|stringformat:"04d" }}</strong>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+</div>
+
+<script src="{% static 'js/tenant-upload-validation.js' %}" defer></script>
+<script>
+  function handleFilePreview(inputId, previewContainerId, previewImgId, statusAreaId) {
+    const fileInput = document.getElementById(inputId);
+    const previewContainer = document.getElementById(previewContainerId);
+    const previewImg = document.getElementById(previewImgId);
+    const statusArea = document.getElementById(statusAreaId);
+
+    if (fileInput) {
+      fileInput.addEventListener('change', function(event) {
+        const file = event.target.files[0];
+        if (file && file.type.startsWith('image/')) {
+          const reader = new FileReader();
+          reader.onload = function(e) {
+            previewImg.src = e.target.result;
+            previewContainer.classList.remove('hidden');
+            if (statusArea) {
+              statusArea.style.display = 'none';
+            }
+          };
+          reader.readAsDataURL(file);
+        } else if (file && file.type === 'application/pdf') {
+            previewImg.src = ''; 
+            previewContainer.classList.add('hidden');
+            if (statusArea) {
+              statusArea.style.display = 'block'; 
+              statusArea.innerHTML = '<strong class="text-slate-700">PDF File Selected: ' + file.name + '</strong>';
+            }
+        } else {
+          previewContainer.classList.add('hidden');
+          if (statusArea) {
+            statusArea.style.display = 'block';
+            statusArea.innerHTML = '<strong class="text-slate-700">Selected File: ' + (file ? file.name : 'None') + '</strong>';
+          }
+        }
+      });
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', function() {
+    handleFilePreview('contract_file', 'contract_preview_container', 'contract_preview_img', 'contract_status_area');
+    handleFilePreview('valid_id_file', 'valid_id_preview_container', 'valid_id_preview_img', 'valid_id_status_area');
+  });
+</script>
+{% endblock %}

@@ -1,0 +1,199 @@
+{% extends "tenant_base.html" %}
+{% load humanize %}
+{% block title %}Pay in Cash | RealEstate360+{% endblock %}
+{% block meta_description %}Pick a time to pay your rent in cash at the office.{% endblock %}
+
+{% block tenant_content %}
+<div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12 font-sans">
+
+  <!-- Navigation: Consistent Back Button -->
+  <nav class="flex items-center pb-6">
+    <a href="{{ back_url }}" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-sm group">
+      <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+      </svg>
+      <span>Back</span>
+    </a>
+  </nav>
+
+  <!-- Page Header (Mega-Card Style) -->
+  <div class="mb-10 relative rounded-[3rem] p-1 overflow-hidden shadow-2xl bg-gradient-to-br from-emerald-400 via-emerald-500 to-teal-600">
+    <div class="bg-white rounded-[2.9rem] overflow-hidden flex flex-col lg:flex-row">
+      
+      <!-- Left Side -->
+      <div class="flex-1 p-8 sm:p-12 bg-emerald-50/30">
+        <div class="flex flex-wrap items-center gap-3 mb-6">
+          <span class="text-xs font-black uppercase tracking-widest text-emerald-600">
+            Cash Payment
+          </span>
+          <span class="bg-emerald-100 text-emerald-800 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest border border-emerald-200">Face-to-Face</span>
+        </div>
+
+        <h2 class="text-5xl sm:text-6xl font-black tracking-tight text-slate-900 mb-2">
+          Pay in Cash
+        </h2>
+        <p class="text-sm font-bold text-slate-500 max-w-xl">
+          Pick a date and time to visit the office and pay in person.
+        </p>
+      </div>
+
+      <!-- Right Side -->
+      <div class="lg:w-96 flex flex-col justify-center p-8 sm:p-12 bg-emerald-50 border-t lg:border-t-0 lg:border-l border-emerald-100">
+        <span class="text-[10px] font-black uppercase tracking-widest text-emerald-600 block mb-2">
+          Amount to Pay
+        </span>
+        <strong class="text-5xl font-black text-slate-900 tracking-tight block">
+          &#8369;{{ amount_to_pay|floatformat:2|intcomma }}
+        </strong>
+        <p class="mt-4 text-sm font-bold leading-relaxed text-emerald-800/80">
+          Prepare the exact amount in cash before arriving at the office.
+        </p>
+      </div>
+
+    </div>
+  </div>
+
+  {% if error %}
+    <div class="mb-10 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl p-6 flex items-start gap-4 shadow-sm animate-[pulse_2s_ease-in-out_1]">
+      <div>
+        <p class="text-sm font-black uppercase tracking-widest text-rose-500 mb-1">Scheduling Error</p>
+        <p class="text-lg font-bold text-rose-800">{{ error }}</p>
+      </div>
+    </div>
+  {% endif %}
+
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12">
+
+    <!-- Payment Summary -->
+    <div class="lg:col-span-7 flex flex-col gap-6">
+      <div class="bg-white border border-slate-200 rounded-[2.5rem] p-8 sm:p-10 shadow-sm flex flex-col justify-between h-full">
+        <div>
+          <div class="border-b border-slate-100 pb-6 mb-8">
+            <h2 class="text-2xl font-black text-slate-900">Payment Summary</h2>
+            <p class="text-sm font-semibold text-slate-500 mt-1">What you are paying today.</p>
+          </div>
+
+          <div class="mb-8">
+            <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-2">Payment for</span>
+            <div class="p-4 rounded-2xl bg-slate-50 border border-slate-200 font-bold text-lg text-slate-800">
+              {% if payment_type == "full" %}Rent, Water & Maintenance
+              {% elif payment_type == "rent_only" %}Monthly Rent
+              {% elif payment_type == "water_only" %}Water Only
+              {% elif payment_type == "maintenance_only" %}Maintenance Charge Only
+              {% else %}Rent & Water{% endif %}
+            </div>
+          </div>
+
+          <div class="pt-6 border-t border-slate-100">
+            <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-6">How to pay in person</span>
+            <ol class="space-y-4">
+              <li class="flex items-start gap-4">
+                <span class="w-7 h-7 rounded-full bg-emerald-50 text-emerald-600 border border-emerald-100 font-black text-sm flex items-center justify-center shrink-0">1</span>
+                <p class="text-base text-slate-700 font-medium pt-0.5">Pick a date and time you want to visit.</p>
+              </li>
+              <li class="flex items-start gap-4">
+                <span class="w-7 h-7 rounded-full bg-emerald-50 text-emerald-600 border border-emerald-100 font-black text-sm flex items-center justify-center shrink-0">2</span>
+                <p class="text-base text-slate-700 font-medium pt-0.5">Send your schedule to our office.</p>
+              </li>
+              <li class="flex items-start gap-4">
+                <span class="w-7 h-7 rounded-full bg-emerald-50 text-emerald-600 border border-emerald-100 font-black text-sm flex items-center justify-center shrink-0">3</span>
+                <p class="text-base text-slate-700 font-medium pt-0.5">Wait for us to confirm your visit.</p>
+              </li>
+              <li class="flex items-start gap-4">
+                <span class="w-7 h-7 rounded-full bg-emerald-50 text-emerald-600 border border-emerald-100 font-black text-sm flex items-center justify-center shrink-0">4</span>
+                <p class="text-base text-slate-700 font-medium pt-0.5">Visit the office and pay in cash.</p>
+              </li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Scheduling Form -->
+    <div class="lg:col-span-5 flex flex-col gap-6">
+      <div class="bg-white border border-slate-200 rounded-[2.5rem] p-8 sm:p-10 shadow-sm flex flex-col justify-between h-full">
+        <div>
+          <div class="border-b border-slate-100 pb-6 mb-8">
+            <h2 class="text-2xl font-black text-slate-900">Set Schedule</h2>
+            <p class="text-sm font-semibold text-slate-500 mt-1">Select when you will visit the office.</p>
+          </div>
+
+          <form method="post" class="space-y-6 flex flex-col h-full">
+            {% csrf_token %}
+            <input type="hidden" name="amount" value="{{ amount_to_pay }}">
+            <input type="hidden" name="bill_ids" value="{{ bill_ids }}">
+            <input type="hidden" name="payment_type" value="{{ payment_type|default:'full' }}">
+
+            <!-- Date -->
+            <div class="space-y-2">
+              <label class="block text-[10px] font-black text-slate-600 uppercase tracking-widest">
+                Date <span class="text-rose-500">*</span>
+              </label>
+              <input type="date" name="preferred_date" required
+                     value="{{ preferred_date }}"
+                     min="{% now 'Y-m-d' %}"
+                     class="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-lg font-bold text-slate-900 focus:bg-white focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10 transition-all outline-none">
+              <p class="text-xs text-slate-500 font-medium mt-2">* Available {{ office_hours_label }}.</p>
+            </div>
+
+            <!-- Time -->
+            <div class="space-y-2">
+              <label class="block text-[10px] font-black text-slate-600 uppercase tracking-widest">
+                Time <span class="text-slate-400">(Optional)</span>
+              </label>
+              <select name="preferred_time"
+                      class="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-lg font-bold text-slate-900 focus:bg-white focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10 transition-all outline-none cursor-pointer">
+                <option value="">Any office-hour slot</option>
+                {% for slot in office_time_slots %}
+                  <option value="{{ slot|time:'H:i' }}" {% if preferred_time == slot|time:'H:i' %}selected{% endif %}>
+                    {{ slot|time:"g:i A" }}
+                  </option>
+                {% endfor %}
+              </select>
+            </div>
+
+            <!-- Notes -->
+            <div class="space-y-2">
+              <label class="block text-[10px] font-black text-slate-600 uppercase tracking-widest">
+                Notes <span class="text-slate-400">(Optional)</span>
+              </label>
+              <textarea name="tenant_note" rows="3"
+                        class="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-base font-medium text-slate-900 focus:bg-white focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10 transition-all outline-none resize-none"
+                        placeholder="Any special requests?">{{ tenant_note }}</textarea>
+            </div>
+
+            <div class="bg-amber-50 rounded-2xl p-5 border border-amber-100 mt-6 mb-6">
+              <p class="text-sm font-medium text-slate-700 leading-relaxed">
+                Your payment is only confirmed <strong class="text-slate-900">after</strong> we receive it at the office.
+              </p>
+            </div>
+
+            <button type="submit"
+                    class="w-full bg-slate-900 hover:bg-slate-800 text-white font-black py-4 px-6 rounded-2xl text-lg transition-all shadow-lg hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center mt-auto">
+              Confirm Schedule
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    const dateInput = document.querySelector('input[name="preferred_date"]');
+    if (!dateInput) return;
+    dateInput.addEventListener("change", function () {
+      const selected = new Date(`${dateInput.value}T00:00:00`);
+      const day = selected.getDay();
+      if (day === 0 || day === 6) {
+        dateInput.setCustomValidity("Office cash payments are available Monday to Friday only.");
+        dateInput.reportValidity();
+      } else {
+        dateInput.setCustomValidity("");
+      }
+    });
+  });
+</script>
+{% endblock %}

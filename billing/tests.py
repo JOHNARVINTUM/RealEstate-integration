@@ -1,0 +1,1765 @@
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import patch
+
+from django.core.exceptions import ValidationError
+from django.contrib.admin.models import LogEntry
+from django.db import IntegrityError
+from django.test import TestCase
+from django.urls import reverse
+from django.utils import timezone
+
+from accounts.models import User
+from billing.models import BillingInvoice, BillLineItem, MonthlyBill
+from billing.services import (
+    approve_manual_payment,
+    compute_weekly_interest,
+    ensure_bills_since_move_in,
+    ensure_current_month_bill_for_lease,
+    ensure_current_month_bills,
+    ensure_bills_up_to,
+    add_months,
+    ensure_bill_line_items_from_legacy,
+    get_or_update_monthly_bill,
+    parse_bill_ids,
+    repair_inflated_unpaid_late_fees,
+    reconcile_approved_payments_for_tenant,
+    _render_invoice_email,
+    sync_monthly_bill_from_line_items,
+    set_bill_line_item_amount,
+)
+from payments.models import ManualPayment
+from rentals.models import Lease, Notification, Unit
+from water.models import WaterBill, WaterBillingSettings, WaterRate, WaterReading
+
+
+class BillingWorkflowTests(TestCase):
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="tenant@gmail.com",
+            username="tenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.other_tenant = User.objects.create_user(
+            email="other@gmail.com",
+            username="other",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.unit = Unit.objects.create(number="A-101")
+        self.other_unit = Unit.objects.create(number="A-102")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=31,
+            start_date=date(2026, 1, 15),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.other_lease = Lease.objects.create(
+            tenant=self.other_tenant,
+            unit=self.other_unit,
+            monthly_rent=Decimal("8000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            is_active=True,
+        )
+
+    def test_ensure_bills_since_move_in_creates_one_bill_per_month(self):
+        WaterBill.objects.create(
+            unit=self.unit,
+            period_start=date(2026, 2, 1),
+            period_end=date(2026, 2, 28),
+            rate_per_cu_m=Decimal("10.00"),
+            prev_reading=Decimal("1.00"),
+            curr_reading=Decimal("6.00"),
+            status="POSTED",
+        )
+
+        ensure_bills_since_move_in(self.lease, today=date(2026, 3, 3))
+        ensure_bills_since_move_in(self.lease, today=date(2026, 3, 3))
+
+        bills = list(MonthlyBill.objects.filter(lease=self.lease).order_by("billing_month"))
+        self.assertEqual([bill.billing_month for bill in bills], [
+            date(2026, 1, 1),
+            date(2026, 2, 1),
+            date(2026, 3, 1),
+        ])
+        self.assertEqual(len(bills), 3)
+        self.assertEqual(bills[0].due_date, date(2026, 1, 31))
+        self.assertEqual(bills[1].water_amount, Decimal("50.00"))
+
+    def test_ensure_bills_up_to_uses_bulk_path_instead_of_per_month_updates(self):
+        with patch("billing.services.get_or_update_monthly_bill") as mocked_get_or_update:
+            ensure_bills_up_to(self.lease, date(2026, 12, 1), today=date(2026, 6, 1))
+
+        self.assertFalse(mocked_get_or_update.called)
+        bills = list(MonthlyBill.objects.filter(lease=self.lease).order_by("billing_month"))
+        self.assertEqual([bill.billing_month for bill in bills], [
+            date(2026, 6, 1),
+            date(2026, 7, 1),
+            date(2026, 8, 1),
+            date(2026, 9, 1),
+            date(2026, 10, 1),
+            date(2026, 11, 1),
+            date(2026, 12, 1),
+        ])
+        self.assertEqual(len(bills), 7)
+
+    def test_approve_manual_payment_rejects_bills_outside_payment_owner(self):
+        tenant_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10000.00"),
+        )
+        other_bill = MonthlyBill.objects.create(
+            lease=self.other_lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 5),
+            base_rent=Decimal("8000.00"),
+            water_amount=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("8000.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-123",
+            bill_ids=f"{tenant_bill.id},{tenant_bill.id},{other_bill.id},invalid",
+            amount=Decimal("10000.00"),
+        )
+
+        with self.assertRaises(ValidationError):
+            approve_manual_payment(payment)
+
+        tenant_bill.refresh_from_db()
+        other_bill.refresh_from_db()
+        payment.refresh_from_db()
+
+        self.assertEqual(payment.status, "PENDING")
+        self.assertEqual(tenant_bill.status, "UNPAID")
+        self.assertEqual(other_bill.status, "UNPAID")
+        self.assertEqual(parse_bill_ids(payment.bill_ids), [tenant_bill.id, other_bill.id])
+
+    def test_approve_manual_payment_is_idempotent_for_payment_owner_bill(self):
+        tenant_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10000.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-123",
+            bill_ids=f"{tenant_bill.id},{tenant_bill.id},invalid",
+            amount=Decimal("10000.00"),
+        )
+
+        approve_manual_payment(payment)
+        approve_manual_payment(payment)
+
+        tenant_bill.refresh_from_db()
+        payment.refresh_from_db()
+
+        self.assertEqual(payment.status, "APPROVED")
+        self.assertEqual(tenant_bill.status, "PAID")
+        self.assertEqual(tenant_bill.payment_reference, "REF-123")
+        self.assertIsNotNone(tenant_bill.paid_at)
+        self.assertEqual(parse_bill_ids(payment.bill_ids), [tenant_bill.id])
+        self.assertEqual(BillingInvoice.objects.filter(payment=payment).count(), 1)
+
+    def test_approve_rent_payment_creates_invoice_email_with_interest_snapshot(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 6, 1),
+            due_date=date(2026, 6, 30),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("500.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("300.00"),
+            total_due=Decimal("10800.00"),
+            status="UNPAID",
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-INV-1",
+            bill_ids=str(bill.id),
+            payment_type="rent_only",
+            payment_method="GCASH",
+            amount=Decimal("10300.00"),
+        )
+
+        with patch("rentals.services.send_email_via_resend", return_value=True) as send_email:
+            approve_manual_payment(payment)
+
+        invoice = BillingInvoice.objects.get(payment=payment)
+        bill.refresh_from_db()
+
+        self.assertTrue(invoice.email_sent)
+        self.assertEqual(invoice.reference_code, "REF-INV-1")
+        self.assertEqual(invoice.amount_paid, Decimal("10300.00"))
+        self.assertEqual(invoice.snapshot["lines"][0]["rent_charge"], "10000.00")
+        self.assertEqual(invoice.snapshot["lines"][0]["water_charge"], "0.00")
+        self.assertEqual(invoice.snapshot["lines"][0]["late_fee"], "300.00")
+        self.assertEqual(invoice.snapshot["lines"][0]["amount_paid"], "10300.00")
+        self.assertEqual(bill.interest, Decimal("300.00"))
+        self.assertEqual(bill.total_due, Decimal("10800.00"))
+        self.assertEqual(bill.total_balance, Decimal("500.00"))
+        email_body = _render_invoice_email(invoice)
+        self.assertIn("Paid This Transaction: PHP 10,300.00", email_body)
+        self.assertIn("Status: PAID", email_body)
+        self.assertNotIn("Totals:", email_body)
+        send_email.assert_called_once()
+
+    def test_deleting_bill_removes_payment_history_reference(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 4, 1),
+            due_date=date(2026, 4, 30),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10000.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-DELETE",
+            bill_ids=f"{bill.id},9999",
+            status="APPROVED",
+        )
+
+        bill.delete()
+        payment.refresh_from_db()
+
+        self.assertEqual(payment.bill_ids, "9999")
+
+    def test_rent_only_payment_settles_rent_and_parking_but_leaves_water(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("500.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("11700.00"),
+            status="UNPAID",
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-RENT-PARKING",
+            bill_ids=str(bill.id),
+            payment_type="rent_only",
+            amount=Decimal("10500.00"),
+            status="PENDING",
+        )
+
+        approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, "APPROVED")
+        self.assertEqual(bill.rent_paid, Decimal("10000.00"))
+        self.assertEqual(bill.parking_paid, Decimal("500.00"))
+        self.assertEqual(bill.water_paid, Decimal("0.00"))
+        self.assertEqual(bill.water_balance, Decimal("1200.00"))
+        self.assertEqual(bill.total_balance, Decimal("1200.00"))
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+        self.assertEqual(
+            bill.line_items.get(line_type=BillLineItem.LINE_TYPE_RENT).status,
+            BillLineItem.STATUS_PAID,
+        )
+        self.assertEqual(
+            bill.line_items.get(line_type=BillLineItem.LINE_TYPE_PARKING).status,
+            BillLineItem.STATUS_PAID,
+        )
+        self.assertEqual(
+            bill.line_items.get(line_type=BillLineItem.LINE_TYPE_WATER).status,
+            BillLineItem.STATUS_UNPAID,
+        )
+
+    def test_rent_only_payment_includes_interest_and_leaves_water(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("500.00"),
+            interest=Decimal("315.00"),
+            total_due=Decimal("12015.00"),
+            status="UNPAID",
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-RENT-PARKING-INTEREST",
+            bill_ids=str(bill.id),
+            payment_type="rent_only",
+            amount=Decimal("10815.00"),
+            status="PENDING",
+        )
+
+        approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, "APPROVED")
+        self.assertEqual(bill.rent_paid, Decimal("10000.00"))
+        self.assertEqual(bill.parking_paid, Decimal("500.00"))
+        self.assertEqual(bill.interest, Decimal("315.00"))
+        self.assertEqual(bill.total_due, Decimal("12015.00"))
+        self.assertEqual(bill.water_paid, Decimal("0.00"))
+        self.assertEqual(bill.water_balance, Decimal("1200.00"))
+        self.assertEqual(bill.total_balance, Decimal("1200.00"))
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+
+    def test_later_water_billing_keeps_advance_rent_paid_and_marks_month_partial(self):
+        WaterRate.objects.create(
+            effective_date=date(2026, 2, 1),
+            rate_per_cu_m=Decimal("45.00"),
+        )
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("500.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10500.00"),
+            status="UNPAID",
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-ADVANCE-RENT",
+            bill_ids=str(bill.id),
+            payment_type="rent_only",
+            amount=Decimal("10500.00"),
+            status="PENDING",
+        )
+        approve_manual_payment(payment)
+
+        reading = WaterReading.objects.create(
+            lease=self.lease,
+            reading_month=date(2026, 2, 1),
+            previous_reading=Decimal("10.00"),
+            current_reading=Decimal("15.00"),
+            consumption=Decimal("5.00"),
+            rate_used=Decimal("45.00"),
+            base_water_amount=Decimal("225.00"),
+            shared_pump_amount=Decimal("0.00"),
+            vat_percent=Decimal("0.00"),
+            vat_amount=Decimal("0.00"),
+            previous_unpaid_water_amount=Decimal("0.00"),
+            computed_amount=Decimal("225.00"),
+        )
+
+        from water.services import create_or_update_monthly_bill_from_reading
+
+        create_or_update_monthly_bill_from_reading(reading, force_update=True)
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.rent_paid, Decimal("10000.00"))
+        self.assertEqual(bill.parking_paid, Decimal("500.00"))
+        self.assertEqual(bill.water_amount, Decimal("225.00"))
+        self.assertEqual(bill.water_paid, Decimal("0.00"))
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+        self.assertEqual(bill.total_balance, Decimal("225.00"))
+        self.assertEqual(
+            bill.line_items.get(line_type=BillLineItem.LINE_TYPE_WATER).status,
+            BillLineItem.STATUS_UNPAID,
+        )
+
+    def test_full_payment_marks_all_monthly_line_items_paid(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("500.00"),
+            interest=Decimal("315.00"),
+            total_due=Decimal("12015.00"),
+            status="UNPAID",
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-FULL-LINES",
+            bill_ids=str(bill.id),
+            payment_type="full",
+            amount=Decimal("12015.00"),
+            status="PENDING",
+        )
+
+        approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.status, "PAID")
+        self.assertEqual(bill.total_balance, Decimal("0.00"))
+        statuses = set(bill.line_items.values_list("status", flat=True))
+        self.assertEqual(statuses, {BillLineItem.STATUS_PAID})
+
+    def test_full_payment_includes_maintenance_charge(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("500.00"),
+            interest=Decimal("315.00"),
+            total_due=Decimal("12915.00"),
+            status="UNPAID",
+        )
+        BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("900.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-FULL-MAINTENANCE",
+            bill_ids=str(bill.id),
+            payment_type="full",
+            amount=Decimal("12915.00"),
+            status="PENDING",
+        )
+
+        with patch("rentals.services.send_email_via_resend", return_value=True):
+            approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        invoice = BillingInvoice.objects.get(payment=payment)
+        maintenance_line = bill.line_items.get(line_type=BillLineItem.LINE_TYPE_MAINTENANCE)
+
+        self.assertEqual(bill.status, "PAID")
+        self.assertEqual(bill.maintenance_amount, Decimal("900.00"))
+        self.assertEqual(bill.maintenance_balance, Decimal("0.00"))
+        self.assertEqual(maintenance_line.status, BillLineItem.STATUS_PAID)
+        self.assertEqual(invoice.snapshot["lines"][0]["maintenance_charge"], "900.00")
+        self.assertIn("Maintenance: PHP 900.00", _render_invoice_email(invoice))
+
+    def test_rent_only_payment_ignores_maintenance_charge(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("500.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("12600.00"),
+            status="UNPAID",
+        )
+        BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("900.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-RENT-IGNORE-MAINT",
+            bill_ids=str(bill.id),
+            payment_type="rent_only",
+            amount=Decimal("10500.00"),
+            status="PENDING",
+        )
+
+        with patch("rentals.services.send_email_via_resend", return_value=True):
+            approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        maintenance_line = bill.line_items.get(line_type=BillLineItem.LINE_TYPE_MAINTENANCE)
+
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+        self.assertEqual(maintenance_line.status, BillLineItem.STATUS_UNPAID)
+        self.assertEqual(bill.maintenance_balance, Decimal("900.00"))
+        self.assertEqual(bill.total_balance, Decimal("2100.00"))
+
+    def test_water_only_payment_ignores_maintenance_charge(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("12100.00"),
+            status="UNPAID",
+        )
+        BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("900.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-WATER-IGNORE-MAINT",
+            bill_ids=str(bill.id),
+            payment_type="water_only",
+            amount=Decimal("1200.00"),
+            status="PENDING",
+        )
+
+        with patch("rentals.services.send_email_via_resend", return_value=True):
+            approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        maintenance_line = bill.line_items.get(line_type=BillLineItem.LINE_TYPE_MAINTENANCE)
+
+        self.assertEqual(bill.water_paid, Decimal("1200.00"))
+        self.assertEqual(maintenance_line.status, BillLineItem.STATUS_UNPAID)
+        self.assertEqual(bill.maintenance_balance, Decimal("900.00"))
+        self.assertEqual(bill.total_balance, Decimal("10900.00"))
+
+    def test_maintenance_only_payment_settles_only_maintenance_charge(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("12100.00"),
+            status="UNPAID",
+        )
+        BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("900.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-MAINTENANCE-ONLY",
+            bill_ids=str(bill.id),
+            payment_type="maintenance_only",
+            amount=Decimal("900.00"),
+            status="PENDING",
+        )
+
+        with patch("rentals.services.send_email_via_resend", return_value=True):
+            approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        maintenance_line = bill.line_items.get(line_type=BillLineItem.LINE_TYPE_MAINTENANCE)
+        rent_line = bill.line_items.get(line_type=BillLineItem.LINE_TYPE_RENT)
+        water_line = bill.line_items.get(line_type=BillLineItem.LINE_TYPE_WATER)
+
+        self.assertEqual(maintenance_line.status, BillLineItem.STATUS_PAID)
+        self.assertEqual(maintenance_line.paid_amount, Decimal("900.00"))
+        self.assertEqual(rent_line.status, BillLineItem.STATUS_UNPAID)
+        self.assertEqual(water_line.status, BillLineItem.STATUS_UNPAID)
+        self.assertEqual(bill.maintenance_balance, Decimal("0.00"))
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+        self.assertEqual(bill.total_balance, Decimal("11200.00"))
+
+    def test_bill_only_becomes_paid_when_all_balances_are_settled_after_maintenance_payment(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 28),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("12100.00"),
+            status="UNPAID",
+        )
+        BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("900.00"),
+        )
+        maintenance_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-MAINT-FIRST",
+            bill_ids=str(bill.id),
+            payment_type="maintenance_only",
+            amount=Decimal("900.00"),
+            status="PENDING",
+        )
+        full_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-FULL-AFTER-MAINT",
+            bill_ids=str(bill.id),
+            payment_type="full",
+            amount=Decimal("11200.00"),
+            status="PENDING",
+        )
+
+        with patch("rentals.services.send_email_via_resend", return_value=True):
+            approve_manual_payment(maintenance_payment)
+            approve_manual_payment(full_payment)
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.status, "PAID")
+        self.assertEqual(bill.total_balance, Decimal("0.00"))
+
+    def test_water_payment_refreshes_future_unpaid_carryover(self):
+        WaterRate.objects.create(
+            effective_date=date(2026, 5, 1),
+            rate_per_cu_m=Decimal("45.00"),
+        )
+        WaterBillingSettings.objects.create(
+            reading_month=date(2026, 6, 1),
+            shared_pump_total=Decimal("1110.08"),
+            vat_percent=Decimal("12.00"),
+        )
+        may_reading = WaterReading.objects.create(
+            lease=self.lease,
+            reading_month=date(2026, 5, 1),
+            previous_reading=Decimal("1795.33"),
+            current_reading=Decimal("1848.87"),
+            consumption=Decimal("53.54"),
+            rate_used=Decimal("45.00"),
+            computed_amount=Decimal("2409.30"),
+        )
+        june_reading = WaterReading.objects.create(
+            lease=self.lease,
+            reading_month=date(2026, 6, 1),
+            previous_reading=Decimal("1848.87"),
+            current_reading=Decimal("1900.87"),
+            consumption=Decimal("52.00"),
+            rate_used=Decimal("45.00"),
+            base_water_amount=Decimal("2340.00"),
+            shared_pump_amount=Decimal("1110.08"),
+            vat_percent=Decimal("12.00"),
+            vat_amount=Decimal("414.01"),
+            previous_unpaid_water_amount=Decimal("2409.30"),
+            computed_amount=Decimal("6273.39"),
+        )
+        may_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 5, 1),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("2409.30"),
+            total_due=Decimal("12409.30"),
+            status="UNPAID",
+            source_water_reading=may_reading,
+        )
+        june_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 6, 1),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("6273.39"),
+            total_due=Decimal("16273.39"),
+            status="UNPAID",
+            source_water_reading=june_reading,
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-WATER-MAY",
+            bill_ids=str(may_bill.id),
+            payment_type="water_only",
+            amount=Decimal("2409.30"),
+            status="PENDING",
+        )
+
+        approve_manual_payment(payment)
+
+        may_bill.refresh_from_db()
+        june_bill.refresh_from_db()
+        june_reading.refresh_from_db()
+        self.assertEqual(may_bill.water_paid, Decimal("2409.30"))
+        self.assertEqual(june_reading.previous_unpaid_water_amount, Decimal("0.00"))
+        self.assertEqual(june_reading.computed_amount, Decimal("3864.09"))
+        self.assertEqual(june_bill.water_amount, Decimal("3864.09"))
+        self.assertEqual(june_bill.status, "UNPAID")
+
+    def test_penalty_starts_only_after_two_weeks_late(self):
+        interest, is_late, weeks_late = compute_weekly_interest(
+            Decimal("10000.00"),
+            due_date=date(2026, 7, 5),
+            today=date(2026, 7, 18),
+        )
+
+        self.assertTrue(is_late)
+        self.assertEqual(weeks_late, 0)
+        self.assertEqual(interest, Decimal("0.00"))
+
+    def test_penalty_becomes_flat_three_percent_after_two_weeks(self):
+        interest, is_late, weeks_late = compute_weekly_interest(
+            Decimal("10000.00"),
+            due_date=date(2026, 7, 5),
+            today=date(2026, 7, 19),
+        )
+
+        self.assertTrue(is_late)
+        self.assertEqual(weeks_late, 2)
+        self.assertEqual(interest, Decimal("300.00"))
+
+    def test_penalty_does_not_continue_progressing_after_two_weeks(self):
+        interest, is_late, weeks_late = compute_weekly_interest(
+            Decimal("10000.00"),
+            due_date=date(2026, 7, 5),
+            today=date(2026, 8, 20),
+        )
+
+        self.assertTrue(is_late)
+        self.assertEqual(weeks_late, 2)
+        self.assertEqual(interest, Decimal("300.00"))
+
+    def test_repair_inflated_unpaid_late_fees_uses_flat_three_percent_rule(self):
+        inflated_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 1, 1),
+            due_date=date(2026, 1, 5),
+            base_rent=Decimal("24585.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("106944.75"),
+            total_due=Decimal("131529.75"),
+            status="UNPAID",
+        )
+        paid_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 5),
+            base_rent=Decimal("24585.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("106944.75"),
+            total_due=Decimal("131529.75"),
+            status="PAID",
+        )
+
+        preview = repair_inflated_unpaid_late_fees(today=date(2026, 6, 11))
+        candidate = next(row for row in preview["eligible"] if row["bill_id"] == inflated_bill.pk)
+        result = repair_inflated_unpaid_late_fees(
+            today=date(2026, 6, 11),
+            dry_run=False,
+            bill_ids=[inflated_bill.pk],
+            preview_tokens={str(inflated_bill.pk): candidate["snapshot_token"]},
+            operator=self.tenant,
+        )
+
+        inflated_bill.refresh_from_db()
+        paid_bill.refresh_from_db()
+        self.assertEqual(result["repaired_count"], 1)
+        self.assertEqual(inflated_bill.interest, Decimal("737.55"))
+        self.assertEqual(inflated_bill.total_due, Decimal("25322.55"))
+        self.assertEqual(paid_bill.interest, Decimal("106944.75"))
+
+    def test_late_penalty_uses_rent_and_parking_base(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 7, 1),
+            due_date=date(2026, 7, 31),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("900.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("11250.00"),
+            status="UNPAID",
+        )
+        self.lease.motorcycle_slots = 1
+        self.lease.save(update_fields=["motorcycle_slots"])
+
+        from billing.services import get_or_update_monthly_bill
+
+        updated_bill = get_or_update_monthly_bill(
+            self.lease,
+            billing_month=date(2026, 7, 1),
+            today=date(2026, 8, 14),
+        )
+
+        bill.refresh_from_db()
+        self.assertEqual(updated_bill.interest, Decimal("310.50"))
+        self.assertEqual(bill.interest, Decimal("310.50"))
+
+    def _assert_bill_ledger_totals(self, bill, *, expected_due, expected_balance):
+        lines = list(bill.line_items.all())
+        line_sum = sum((line.amount for line in lines), Decimal("0.00"))
+        balance_sum = sum((line.balance for line in lines), Decimal("0.00"))
+        self.assertEqual(line_sum, expected_due)
+        self.assertEqual(bill.total_due, line_sum)
+        self.assertEqual(balance_sum, expected_balance)
+        self.assertEqual(bill.total_balance, balance_sum)
+
+    def test_late_fee_boundaries_and_repeated_processing_keep_one_gross_fee(self):
+        self.lease.motorcycle_slots = 1
+        self.lease.due_day = 1
+        self.lease.save(update_fields=["motorcycle_slots", "due_day"])
+
+        scenarios = [
+            (date(2026, 1, 1), 0, Decimal("0.00")),
+            (date(2026, 2, 1), 1, Decimal("0.00")),
+            (date(2026, 3, 1), 13, Decimal("0.00")),
+            (date(2026, 4, 1), 14, Decimal("310.50")),
+            (date(2026, 5, 1), 15, Decimal("310.50")),
+        ]
+        bills_by_offset = {}
+
+        for billing_month, days_after_due, expected_fee in scenarios:
+            due_date = billing_month
+            bill = get_or_update_monthly_bill(
+                self.lease,
+                billing_month=billing_month,
+                today=due_date + timedelta(days=days_after_due),
+            )
+            bills_by_offset[days_after_due] = bill
+            bill.refresh_from_db()
+            fee_lines = bill.line_items.filter(line_type=BillLineItem.LINE_TYPE_LATE_FEE)
+            self.assertEqual(fee_lines.count(), int(expected_fee > 0))
+            self.assertEqual(bill._is_late, days_after_due > 0)
+            self.assertEqual(bill.interest, expected_fee)
+            self._assert_bill_ledger_totals(
+                bill,
+                expected_due=Decimal("10350.00") + expected_fee,
+                expected_balance=Decimal("10350.00") + expected_fee,
+            )
+
+        april_bill = bills_by_offset[14]
+        get_or_update_monthly_bill(
+            self.lease,
+            billing_month=date(2026, 4, 1),
+            today=date(2026, 4, 16),
+        )
+        april_bill.refresh_from_db()
+        fee_line = april_bill.line_items.get(line_type=BillLineItem.LINE_TYPE_LATE_FEE)
+        self.assertEqual(april_bill.line_items.filter(line_type=BillLineItem.LINE_TYPE_LATE_FEE).count(), 1)
+        self.assertEqual(fee_line.amount, Decimal("310.50"))
+        self.assertEqual(april_bill.total_due, Decimal("10660.50"))
+
+    @patch("billing.services._send_invoice_email")
+    def test_full_payment_preserves_gross_late_fee_through_repeated_sync(self, _send_email):
+        self.lease.motorcycle_slots = 1
+        self.lease.due_day = 1
+        self.lease.save(update_fields=["motorcycle_slots", "due_day"])
+        bill = get_or_update_monthly_bill(
+            self.lease,
+            billing_month=date(2026, 6, 1),
+            today=date(2026, 6, 15),
+        )
+        get_or_update_monthly_bill(
+            self.lease,
+            billing_month=date(2026, 7, 1),
+            today=date(2026, 7, 1),
+        )
+        bill.refresh_from_db()
+        self.assertEqual(bill.total_due, Decimal("10660.50"))
+        self._assert_bill_ledger_totals(
+            bill,
+            expected_due=Decimal("10660.50"),
+            expected_balance=Decimal("10660.50"),
+        )
+
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-LATE-FULL",
+            bill_ids=str(bill.pk),
+            payment_type="full",
+            amount=Decimal("10660.50"),
+            status="PENDING",
+        )
+        approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        fee_line = bill.line_items.get(line_type=BillLineItem.LINE_TYPE_LATE_FEE)
+        self.assertEqual(fee_line.amount, Decimal("310.50"))
+        self.assertEqual(fee_line.paid_amount, Decimal("310.50"))
+        self.assertEqual(fee_line.balance, Decimal("0.00"))
+        self.assertEqual(bill.interest, Decimal("310.50"))
+        self.assertEqual(bill.status, "PAID")
+        self._assert_bill_ledger_totals(
+            bill,
+            expected_due=Decimal("10660.50"),
+            expected_balance=Decimal("0.00"),
+        )
+
+        # Reproduce the old zero-interest summary state and ensure legacy
+        # hydration cannot erase the already-paid fee line.
+        bill.interest = Decimal("0.00")
+        bill.save(update_fields=["interest"])
+        ensure_bill_line_items_from_legacy(bill)
+        fee_line.refresh_from_db()
+        self.assertEqual(fee_line.amount, Decimal("310.50"))
+        self.assertEqual(fee_line.paid_amount, Decimal("310.50"))
+        self.assertEqual(fee_line.balance, Decimal("0.00"))
+
+        sync_monthly_bill_from_line_items(bill)
+        bill.refresh_from_db()
+        self.assertEqual(bill.interest, Decimal("310.50"))
+        self.assertEqual(bill.total_due, Decimal("10660.50"))
+        self._assert_bill_ledger_totals(
+            bill,
+            expected_due=Decimal("10660.50"),
+            expected_balance=Decimal("0.00"),
+        )
+
+    @patch("billing.services._send_invoice_email")
+    def test_partial_water_balance_and_late_fee_are_reconciled_from_lines(self, _send_email):
+        self.lease.motorcycle_slots = 1
+        self.lease.due_day = 1
+        self.lease.save(update_fields=["motorcycle_slots", "due_day"])
+        bill = get_or_update_monthly_bill(
+            self.lease,
+            billing_month=date(2026, 8, 1),
+            today=date(2026, 8, 1),
+        )
+        bill.water_computed_from_system = True
+        bill.save(update_fields=["water_computed_from_system"])
+        set_bill_line_item_amount(
+            bill,
+            BillLineItem.LINE_TYPE_WATER,
+            amount=Decimal("100.00"),
+        )
+        bill.refresh_from_db()
+
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-LATE-PARTIAL",
+            bill_ids=str(bill.pk),
+            payment_type="rent_only",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+        )
+        approve_manual_payment(payment)
+        bill.refresh_from_db()
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+        self.assertEqual(bill.total_balance, Decimal("100.00"))
+
+        bill = get_or_update_monthly_bill(
+            self.lease,
+            billing_month=date(2026, 8, 1),
+            today=date(2026, 8, 15),
+        )
+        bill.refresh_from_db()
+        self.assertEqual(bill.interest, Decimal("310.50"))
+        self.assertEqual(bill.total_due, Decimal("10760.50"))
+        self._assert_bill_ledger_totals(
+            bill,
+            expected_due=Decimal("10760.50"),
+            expected_balance=Decimal("410.50"),
+        )
+
+    @patch("billing.services._send_invoice_email")
+    def test_bill_paid_before_late_fee_threshold_remains_unchanged(self, _send_email):
+        self.lease.motorcycle_slots = 1
+        self.lease.due_day = 1
+        self.lease.save(update_fields=["motorcycle_slots", "due_day"])
+        bill = get_or_update_monthly_bill(
+            self.lease,
+            billing_month=date(2026, 9, 1),
+            today=date(2026, 9, 1),
+        )
+        initial_total = bill.total_due
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-LATE-ONTIME",
+            bill_ids=str(bill.pk),
+            payment_type="full",
+            amount=initial_total,
+            status="PENDING",
+        )
+        approve_manual_payment(payment)
+
+        bill.refresh_from_db()
+        before = (bill.interest, bill.total_due, bill.total_balance, bill.status)
+        get_or_update_monthly_bill(
+            self.lease,
+            billing_month=date(2026, 9, 1),
+            today=date(2026, 9, 16),
+        )
+        bill.refresh_from_db()
+        self.assertEqual(bill.line_items.filter(line_type=BillLineItem.LINE_TYPE_LATE_FEE).count(), 0)
+        self.assertEqual((bill.interest, bill.total_due, bill.total_balance, bill.status), before)
+        self._assert_bill_ledger_totals(
+            bill,
+            expected_due=initial_total,
+            expected_balance=Decimal("0.00"),
+        )
+
+    def test_reconcile_approved_payment_repairs_unapplied_online_payment(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 3, 1),
+            due_date=date(2026, 3, 31),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("900.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("11250.00"),
+            status="UNPAID",
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-REPAIR",
+            bill_ids=str(bill.id),
+            payment_type="rent_only",
+            amount=Decimal("10350.00"),
+            status="APPROVED",
+        )
+
+        reconcile_approved_payments_for_tenant(self.tenant)
+
+        bill.refresh_from_db()
+        self.assertEqual(Notification.objects.filter(user=self.tenant, title="Payment received").count(), 0)
+        self.assertEqual(bill.rent_paid, Decimal("10000.00"))
+        self.assertEqual(bill.parking_paid, Decimal("350.00"))
+        self.assertEqual(bill.water_balance, Decimal("900.00"))
+        self.assertEqual(bill.total_balance, Decimal("900.00"))
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+        self.assertEqual(bill.payment_reference, payment.reference_code)
+
+    def test_reconcile_does_not_reapply_old_water_payment_after_water_bill_edit(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 6, 1),
+            due_date=date(2026, 6, 30),
+            base_rent=Decimal("0.00"),
+            water_amount=Decimal("150.00"),
+            water_paid=Decimal("100.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("150.00"),
+            status="PARTIALLY_PAID",
+            payment_reference="REF-WATER-OLD",
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-WATER-OLD",
+            bill_ids=str(bill.id),
+            payment_type="water_only",
+            amount=Decimal("100.00"),
+            status="APPROVED",
+        )
+
+        reconcile_approved_payments_for_tenant(self.tenant)
+
+        bill.refresh_from_db()
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, "APPROVED")
+        self.assertEqual(bill.water_paid, Decimal("100.00"))
+        self.assertEqual(bill.water_balance, Decimal("50.00"))
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+
+
+class MonthlyBillRefreshMaintenanceLedgerTests(TestCase):
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="maintenance-ledger-refresh@example.test",
+            username="maintenance-ledger-refresh",
+            password="test-password",
+            role=User.Role.TENANT,
+        )
+        self.unit = Unit.objects.create(number="MREF-1")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("8272.00"),
+            due_day=1,
+            start_date=date(2026, 1, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+    def make_bill(
+        self,
+        *,
+        billing_month=date(2026, 9, 1),
+        due_date=date(2026, 9, 1),
+        water=Decimal("0.00"),
+        interest=Decimal("0.00"),
+        maintenance=Decimal("0.00"),
+        rent_paid=Decimal("0.00"),
+        parking_paid=Decimal("0.00"),
+        water_paid=Decimal("0.00"),
+        maintenance_paid=Decimal("0.00"),
+        fee_paid=Decimal("0.00"),
+        status="UNPAID",
+        total_due=None,
+    ):
+        parking = self.lease.parking_fee
+        core_total = (
+            self.lease.monthly_rent + parking + water + interest
+        ).quantize(Decimal("0.01"))
+        paid_at = timezone.now()
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=billing_month,
+            due_date=due_date,
+            base_rent=self.lease.monthly_rent,
+            water_amount=water,
+            water_computed_from_system=bool(water),
+            parking_fee=parking,
+            interest=interest,
+            rent_paid=rent_paid,
+            rent_paid_at=paid_at if rent_paid else None,
+            parking_paid=parking_paid,
+            water_paid=water_paid,
+            water_paid_at=paid_at if water_paid else None,
+            total_due=core_total if total_due is None else total_due,
+            status=status,
+            payment_reference="REF-MAINT-LEDGER-REFRESH",
+        )
+        line_values = [
+            (BillLineItem.LINE_TYPE_RENT, self.lease.monthly_rent, rent_paid),
+            (BillLineItem.LINE_TYPE_PARKING, parking, parking_paid),
+        ]
+        if water:
+            line_values.append((BillLineItem.LINE_TYPE_WATER, water, water_paid))
+        if interest:
+            line_values.append((BillLineItem.LINE_TYPE_LATE_FEE, interest, fee_paid))
+        if maintenance:
+            line_values.append((BillLineItem.LINE_TYPE_MAINTENANCE, maintenance, maintenance_paid))
+
+        for line_type, amount, allocated in line_values:
+            line = BillLineItem(
+                monthly_bill=bill,
+                line_type=line_type,
+                amount=amount,
+                paid_amount=allocated,
+                paid_at=paid_at if allocated else None,
+                payment_reference=bill.payment_reference if allocated else "",
+            )
+            line.refresh_status()
+            line.save()
+        return bill
+
+    def assert_ledger_invariants(self, bill):
+        bill.refresh_from_db()
+        lines = list(bill.line_items.all())
+        self.assertEqual(
+            sum((line.amount for line in lines), Decimal("0.00")),
+            bill.total_due,
+        )
+        self.assertEqual(
+            sum((line.balance for line in lines), Decimal("0.00")),
+            bill.total_balance,
+        )
+
+    def test_refresh_includes_maintenance_in_production_shaped_stale_summary(self):
+        bill = self.make_bill(total_due=Decimal("8272.00"))
+        maintenance = BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("600.00"),
+        )
+
+        get_or_update_monthly_bill(
+            self.lease,
+            bill.billing_month,
+            today=bill.due_date,
+        )
+
+        bill.refresh_from_db()
+        maintenance.refresh_from_db()
+        self.assertEqual(maintenance.amount, Decimal("600.00"))
+        self.assertEqual(bill.total_due, Decimal("8872.00"))
+        self.assert_ledger_invariants(bill)
+
+    def test_refresh_preserves_all_lines_allocations_and_late_fee_basis(self):
+        self.lease.motorcycle_slots = 1
+        self.lease.save(update_fields=["motorcycle_slots"])
+        bill = self.make_bill(
+            billing_month=date(2026, 8, 1),
+            due_date=date(2026, 8, 1),
+            water=Decimal("500.00"),
+            interest=Decimal("258.66"),
+            maintenance=Decimal("600.00"),
+            rent_paid=Decimal("100.00"),
+            parking_paid=Decimal("50.00"),
+            water_paid=Decimal("50.00"),
+            maintenance_paid=Decimal("200.00"),
+            fee_paid=Decimal("25.00"),
+            status="PARTIALLY_PAID",
+            total_due=Decimal("9380.66"),
+        )
+        before = {
+            line.line_type: (line.amount, line.paid_amount, line.paid_at, line.payment_reference)
+            for line in bill.line_items.all()
+        }
+
+        get_or_update_monthly_bill(
+            self.lease,
+            bill.billing_month,
+            today=bill.due_date + timedelta(days=14),
+        )
+        get_or_update_monthly_bill(
+            self.lease,
+            bill.billing_month,
+            today=bill.due_date + timedelta(days=14),
+        )
+
+        bill.refresh_from_db()
+        after = {
+            line.line_type: (line.amount, line.paid_amount, line.paid_at, line.payment_reference)
+            for line in bill.line_items.all()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(bill.interest, Decimal("258.66"))
+        self.assertEqual(bill.total_due, Decimal("9980.66"))
+        self.assertEqual(
+            bill.line_items.filter(line_type=BillLineItem.LINE_TYPE_LATE_FEE).count(),
+            1,
+        )
+        # 3% is calculated from rent + parking only, not water or maintenance.
+        self.assertEqual(bill.interest, (Decimal("8272.00") + Decimal("350.00")) * Decimal("0.03"))
+        self.assert_ledger_invariants(bill)
+
+    def test_fully_paid_maintenance_line_remains_paid_after_refresh(self):
+        bill = self.make_bill(
+            status="PARTIALLY_PAID",
+            maintenance=Decimal("600.00"),
+            maintenance_paid=Decimal("600.00"),
+            total_due=Decimal("8272.00"),
+        )
+        line = bill.line_items.get(line_type=BillLineItem.LINE_TYPE_MAINTENANCE)
+        before = (line.amount, line.paid_amount, line.status, line.paid_at, line.payment_reference)
+
+        get_or_update_monthly_bill(self.lease, bill.billing_month, today=bill.due_date)
+
+        bill.refresh_from_db()
+        line.refresh_from_db()
+        self.assertEqual(
+            (line.amount, line.paid_amount, line.status, line.paid_at, line.payment_reference),
+            before,
+        )
+        self.assertEqual(bill.total_due, Decimal("8872.00"))
+        self.assert_ledger_invariants(bill)
+
+    def test_bulk_range_refresh_includes_existing_maintenance_line(self):
+        today = timezone.localdate()
+        billing_month = today.replace(day=1)
+        self.lease.due_day = 25
+        self.lease.save(update_fields=["due_day"])
+        bill = self.make_bill(
+            billing_month=billing_month,
+            due_date=date(billing_month.year, billing_month.month, self.lease.due_day),
+            total_due=Decimal("8272.00"),
+        )
+        BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("600.00"),
+        )
+
+        ensure_bills_up_to(self.lease, billing_month, today=today)
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.total_due, Decimal("8872.00"))
+        self.assert_ledger_invariants(bill)
+
+
+class LeaseActivationTimezoneTests(TestCase):
+    """
+    Ensure Lease.save() uses timezone.localdate() (Asia/Manila)
+    so leases starting "today" in PH time are always marked active,
+    even when UTC date is still yesterday.
+    """
+
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="tz_tenant@gmail.com",
+            username="tz_tenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.unit = Unit.objects.create(number="TZ-001")
+
+    def test_lease_active_when_start_date_is_today_local(self):
+        from django.utils import timezone
+        today_local = timezone.localdate()
+        lease = Lease.objects.create(
+            tenant=self.tenant, unit=self.unit,
+            monthly_rent=Decimal("10000.00"), due_day=5, start_date=today_local,
+        )
+        self.assertEqual(lease.status, Lease.STATUS_PENDING_PAYMENT)
+        self.assertFalse(lease.is_active)
+
+    def test_lease_active_when_start_date_is_in_past(self):
+        lease = Lease.objects.create(
+            tenant=self.tenant, unit=self.unit,
+            monthly_rent=Decimal("10000.00"), due_day=5, start_date=date(2025, 1, 1),
+        )
+        self.assertEqual(lease.status, Lease.STATUS_PENDING_PAYMENT)
+        self.assertFalse(lease.is_active)
+
+    def test_lease_inactive_when_start_date_is_future(self):
+        from django.utils import timezone
+        from datetime import timedelta
+        tomorrow = timezone.localdate() + timedelta(days=1)
+        lease = Lease.objects.create(
+            tenant=self.tenant, unit=self.unit,
+            monthly_rent=Decimal("10000.00"), due_day=5, start_date=tomorrow,
+        )
+        self.assertFalse(lease.is_active)
+
+    def test_lease_uses_localdate_not_utc(self):
+        """Simulate 1 AM Manila (May 25) = 5 PM UTC (May 24). Lease starting May 25 must be active."""
+        from unittest.mock import patch
+        from django.utils import timezone
+        from datetime import datetime
+        import zoneinfo
+
+        fake_now = datetime(2026, 5, 24, 17, 0, 0, tzinfo=zoneinfo.ZoneInfo("UTC"))
+        with patch("django.utils.timezone.now", return_value=fake_now):
+            local_date = timezone.localdate()
+            lease = Lease.objects.create(
+                tenant=self.tenant, unit=self.unit,
+                monthly_rent=Decimal("10000.00"), due_day=5, start_date=date(2026, 5, 25),
+            )
+            self.assertEqual(local_date, date(2026, 5, 25))
+            self.assertEqual(lease.status, Lease.STATUS_PENDING_PAYMENT)
+            self.assertFalse(lease.is_active)
+
+
+class MoveInFirstMonthPaidTests(TestCase):
+    """
+    Ensure the move-in flow marks the first month bill as PAID.
+    """
+
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="movein_tenant@gmail.com",
+            username="movein_tenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.unit = Unit.objects.create(number="MI-001")
+
+    def test_first_month_bill_marked_paid_after_move_in(self):
+        from billing.services import month_start, get_or_update_monthly_bill, set_bill_status, ensure_bills_since_move_in
+        from django.utils import timezone
+
+        today_local = timezone.localdate()
+        lease = Lease.objects.create(
+            tenant=self.tenant, unit=self.unit,
+            monthly_rent=Decimal("11666.00"), due_day=5, start_date=today_local,
+        )
+        ensure_bills_since_move_in(lease)
+
+        first_bill_month = month_start(lease.start_date)
+        first_bill = MonthlyBill.objects.filter(lease=lease, billing_month=first_bill_month).first()
+        if not first_bill:
+            first_bill = get_or_update_monthly_bill(lease, first_bill_month)
+
+        self.assertIsNotNone(first_bill)
+
+        set_bill_status(first_bill, status="PAID", payment_reference="REF-MOVEIN-TEST", paid_at=timezone.now())
+        move_in_payment = ManualPayment.objects.create(
+            user=self.tenant, payment_type="move_in", payment_method="GCASH",
+            amount=lease.total_move_in_cost, reference_code="REF-MOVEIN-TEST",
+            bill_ids=str(first_bill.id), status="APPROVED",
+        )
+
+        first_bill.refresh_from_db()
+        self.assertEqual(first_bill.status, "PAID")
+        self.assertEqual(first_bill.rent_paid, lease.monthly_rent)
+        self.assertEqual(first_bill.total_balance, 0)
+        self.assertEqual(move_in_payment.bill_ids, str(first_bill.id))
+
+    def test_fallback_creates_first_bill_when_ensure_bills_skipped(self):
+        from billing.services import month_start, get_or_update_monthly_bill
+
+        lease = Lease.objects.create(
+            tenant=self.tenant, unit=self.unit,
+            monthly_rent=Decimal("10000.00"), due_day=5, start_date=date(2026, 5, 25),
+        )
+        first_bill_month = month_start(lease.start_date)
+        self.assertEqual(MonthlyBill.objects.filter(lease=lease, billing_month=first_bill_month).count(), 0)
+
+        first_bill = get_or_update_monthly_bill(lease, first_bill_month)
+        self.assertIsNotNone(first_bill)
+        self.assertEqual(first_bill.base_rent, Decimal("10000.00"))
+        self.assertEqual(first_bill.status, "UNPAID")
+
+
+class Phase1CurrentBillingSafetyTests(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.current_month = self.today.replace(day=1)
+        self.previous_month = add_months(self.current_month, -1)
+        self.next_month = add_months(self.current_month, 1)
+
+    def _tenant(self, suffix):
+        return User.objects.create_user(
+            email=f"phase1-{suffix}@example.test",
+            username=f"phase1{suffix}",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+
+    def _lease(self, suffix, **overrides):
+        data = {
+            "tenant": self._tenant(suffix),
+            "unit": Unit.objects.create(number=f"P1-{suffix[:7]}"),
+            "monthly_rent": Decimal("10000.00"),
+            "due_day": 5,
+            "start_date": self.current_month,
+            "status": Lease.STATUS_ACTIVE,
+            "is_active": True,
+        }
+        data.update(overrides)
+        return Lease.objects.create(**data)
+
+    def test_current_month_service_respects_eligibility_boundaries(self):
+        open_ended = self._lease("open")
+        future = self._lease("future", start_date=self.next_month)
+        terminated = self._lease("term", status=Lease.STATUS_TERMINATED, is_active=False)
+        expired = self._lease("expired", status=Lease.STATUS_EXPIRED, is_active=False)
+        ended_before = self._lease("endedbefore", end_date=add_months(self.current_month, -1))
+        ending_this_month = self._lease("endingnow", end_date=self.current_month)
+
+        self.assertEqual(ensure_current_month_bill_for_lease(open_ended, today=self.today)["status"], "created")
+        self.assertEqual(ensure_current_month_bill_for_lease(future, today=self.today)["status"], "ineligible")
+        self.assertEqual(ensure_current_month_bill_for_lease(terminated, today=self.today)["status"], "ineligible")
+        self.assertEqual(ensure_current_month_bill_for_lease(expired, today=self.today)["status"], "ineligible")
+        self.assertEqual(ensure_current_month_bill_for_lease(ended_before, today=self.today)["status"], "ineligible")
+        self.assertEqual(ensure_current_month_bill_for_lease(ending_this_month, today=self.today)["status"], "created")
+
+        self.assertTrue(MonthlyBill.objects.filter(lease=open_ended, billing_month=self.current_month).exists())
+        self.assertTrue(MonthlyBill.objects.filter(lease=ending_this_month, billing_month=self.current_month).exists())
+        self.assertFalse(MonthlyBill.objects.filter(lease=future).exists())
+        self.assertFalse(MonthlyBill.objects.filter(lease=terminated).exists())
+        self.assertFalse(MonthlyBill.objects.filter(lease=expired).exists())
+        self.assertFalse(MonthlyBill.objects.filter(lease=ended_before).exists())
+
+    def test_existing_current_month_bills_are_preserved_without_duplicate_line_items(self):
+        lease = self._lease("existing")
+        bill = MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=self.current_month,
+            due_date=self.current_month.replace(day=5),
+            base_rent=Decimal("10000.00"),
+            total_due=Decimal("10000.00"),
+            status="PARTIALLY_PAID",
+            rent_paid=Decimal("2500.00"),
+            payment_reference="KEEP-REFERENCE",
+        )
+        BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_RENT,
+            amount=Decimal("10000.00"),
+            paid_amount=Decimal("2500.00"),
+        )
+
+        result = ensure_current_month_bill_for_lease(lease, today=self.today)
+
+        bill.refresh_from_db()
+        self.assertEqual(result["status"], "existing")
+        self.assertEqual(bill.status, "PARTIALLY_PAID")
+        self.assertEqual(bill.rent_paid, Decimal("2500.00"))
+        self.assertEqual(bill.payment_reference, "KEEP-REFERENCE")
+        self.assertEqual(MonthlyBill.objects.filter(lease=lease, billing_month=self.current_month).count(), 1)
+        self.assertEqual(BillLineItem.objects.filter(monthly_bill=bill, line_type=BillLineItem.LINE_TYPE_RENT).count(), 1)
+
+    def test_current_month_command_does_not_create_prior_missing_months(self):
+        lease = self._lease("history", start_date=self.previous_month)
+
+        summary = ensure_current_month_bills(today=self.today)
+
+        self.assertIn(lease.id, summary["created_lease_ids"])
+        self.assertTrue(MonthlyBill.objects.filter(lease=lease, billing_month=self.current_month).exists())
+        self.assertFalse(MonthlyBill.objects.filter(lease=lease, billing_month=self.previous_month).exists())
+
+    def test_per_lease_failure_does_not_prevent_other_lease_success(self):
+        failed_lease = self._lease("failone")
+        successful_lease = self._lease("succeedone")
+        original = ensure_current_month_bill_for_lease
+
+        def fake_single(lease_id, **kwargs):
+            if lease_id == failed_lease.id:
+                return {"status": "failed", "lease_id": lease_id, "bill_id": None, "error_category": "ValidationError"}
+            return original(lease_id, **kwargs)
+
+        with patch("billing.services.ensure_current_month_bill_for_lease", side_effect=fake_single):
+            summary = ensure_current_month_bills(today=self.today)
+
+        self.assertEqual(summary["failed_count"], 1)
+        self.assertIn(failed_lease.id, [row["lease_id"] for row in summary["failed"]])
+        self.assertTrue(MonthlyBill.objects.filter(lease=successful_lease, billing_month=self.current_month).exists())
+
+    def test_line_item_failure_rolls_back_created_bill_for_that_lease(self):
+        lease = self._lease("rollback")
+
+        with patch("billing.services.ensure_bill_line_items_from_legacy", side_effect=RuntimeError("line failure")):
+            result = ensure_current_month_bill_for_lease(lease, today=self.today)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_category"], "RuntimeError")
+        self.assertFalse(MonthlyBill.objects.filter(lease=lease, billing_month=self.current_month).exists())
+
+    def test_duplicate_race_recovery_returns_existing_bill(self):
+        lease = self._lease("race")
+        existing = MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=self.current_month,
+            due_date=self.current_month.replace(day=5),
+            base_rent=Decimal("10000.00"),
+            total_due=Decimal("10000.00"),
+            status="UNPAID",
+        )
+
+        with patch("billing.services._existing_bill_for_month", side_effect=[None, existing]), patch(
+            "billing.services.get_or_update_monthly_bill",
+            side_effect=IntegrityError("duplicate"),
+        ):
+            result = ensure_current_month_bill_for_lease(lease, today=self.today)
+
+        self.assertEqual(result["status"], "existing")
+        self.assertEqual(result["bill_id"], existing.id)
+        self.assertEqual(MonthlyBill.objects.filter(lease=lease, billing_month=self.current_month).count(), 1)
+
+class Phase1PageFlowHistoricalSafetyTests(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.current_month = self.today.replace(day=1)
+        self.previous_month = add_months(self.current_month, -1)
+        self.tenant = User.objects.create_user(
+            email="phase1-page@example.test",
+            username="phase1page",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=Unit.objects.create(number="P1-PAGE"),
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=self.previous_month,
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+    def test_tenant_dashboard_get_does_not_create_historical_gap(self):
+        self.client.force_login(self.tenant)
+
+        response = self.client.get(reverse("tenant_dashboard"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(MonthlyBill.objects.filter(lease=self.lease, billing_month=self.current_month).exists())
+        self.assertFalse(MonthlyBill.objects.filter(lease=self.lease, billing_month=self.previous_month).exists())
+
+    def test_tenant_billing_get_does_not_create_historical_gap(self):
+        self.client.force_login(self.tenant)
+
+        response = self.client.get(reverse("tenant_billing"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(MonthlyBill.objects.filter(lease=self.lease, billing_month=self.current_month).exists())
+        self.assertFalse(MonthlyBill.objects.filter(lease=self.lease, billing_month=self.previous_month).exists())
+
+
+class LegacyLateFeeRepairSafetyTests(TestCase):
+    audit_date = date(2026, 10, 15)
+
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="legacy-repair-tenant@example.test",
+            username="legacy-repair-tenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.unit = Unit.objects.create(number="LR-101")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=1,
+            start_date=date(2026, 1, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+    def _bill(self, *, status="UNPAID", interest="900.00", total_due=None, **overrides):
+        values = {
+            "lease": self.lease,
+            "billing_month": date(2026, 10, 1),
+            "due_date": date(2026, 10, 1),
+            "base_rent": Decimal("10000.00"),
+            "water_amount": Decimal("200.00"),
+            "parking_fee": Decimal("500.00"),
+            "interest": Decimal(interest),
+            "status": status,
+        }
+        values["total_due"] = (
+            Decimal(values["base_rent"])
+            + Decimal(values["water_amount"])
+            + Decimal(values["parking_fee"])
+            + Decimal(values["interest"])
+            if total_due is None else Decimal(total_due)
+        )
+        values.update(overrides)
+        return MonthlyBill.objects.create(**values)
+
+    def _preview(self, *bill_ids):
+        result = repair_inflated_unpaid_late_fees(today=self.audit_date)
+        rows = {row["bill_id"]: row for row in result["eligible"]}
+        return result, {str(bill_id): rows[bill_id]["snapshot_token"] for bill_id in bill_ids if bill_id in rows}
+
+    def _apply(self, bill_ids, tokens):
+        return repair_inflated_unpaid_late_fees(
+            today=self.audit_date,
+            dry_run=False,
+            bill_ids=bill_ids,
+            preview_tokens=tokens,
+            operator=self.tenant,
+        )
+
+    def test_eligible_legacy_summary_is_repaired_and_audited(self):
+        bill = self._bill()
+        preview, tokens = self._preview(bill.pk)
+        self.assertEqual(preview["eligible_count"], 1)
+        self.assertEqual(preview["eligible"][0]["new_interest"], Decimal("315.00"))
+        self.assertEqual(preview["eligible"][0]["new_total_due"], Decimal("11015.00"))
+
+        result = self._apply([bill.pk], tokens)
+        bill.refresh_from_db()
+        self.assertEqual(result["repaired_count"], 1)
+        self.assertEqual(bill.interest, Decimal("315.00"))
+        self.assertEqual(bill.total_due, Decimal("11015.00"))
+        self.assertFalse(bill.line_items.exists())
+        self.assertGreaterEqual(bill.total_balance, 0)
+        self.assertLessEqual(bill.total_balance, bill.total_due)
+        self.assertEqual(bill.total_balance, bill.total_due)
+        entry = LogEntry.objects.get(object_id=str(bill.pk))
+        self.assertEqual(entry.user, self.tenant)
+        self.assertIn("Interest: 900.00 -> 315.00", entry.change_message)
+        self.assertIn("total_due: 11600.00 -> 11015.00", entry.change_message)
+
+    def test_line_backed_bill_is_skipped_without_summary_or_line_changes(self):
+        bill = self._bill()
+        for line_type, amount in (
+            (BillLineItem.LINE_TYPE_RENT, Decimal("10000.00")),
+            (BillLineItem.LINE_TYPE_WATER, Decimal("200.00")),
+            (BillLineItem.LINE_TYPE_PARKING, Decimal("500.00")),
+            (BillLineItem.LINE_TYPE_LATE_FEE, Decimal("900.00")),
+        ):
+            BillLineItem.objects.create(monthly_bill=bill, line_type=line_type, amount=amount)
+        old_summary = (bill.interest, bill.total_due)
+        old_lines = list(bill.line_items.values_list("line_type", "amount", "paid_amount"))
+
+        result = repair_inflated_unpaid_late_fees(today=self.audit_date)
+
+        bill.refresh_from_db()
+        self.assertEqual((bill.interest, bill.total_due), old_summary)
+        self.assertEqual(list(bill.line_items.values_list("line_type", "amount", "paid_amount")), old_lines)
+        self.assertEqual(sum(bill.line_items.values_list("amount", flat=True)), bill.total_due)
+        self.assertEqual(sum(line.balance for line in bill.line_items.all()), bill.total_balance)
+        self.assertIn("BillLineItems", result["skipped"][0]["reason"])
+
+    def test_paid_late_fee_line_is_never_changed_by_legacy_repair(self):
+        bill = self._bill(status="PARTIALLY_PAID")
+        fee = BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_LATE_FEE,
+            amount=Decimal("900.00"),
+            paid_amount=Decimal("100.00"),
+        )
+        bill.interest = Decimal("900.00")
+        bill.total_due = Decimal("900.00")
+        bill.save(update_fields=["interest", "total_due"])
+
+        result = repair_inflated_unpaid_late_fees(today=self.audit_date)
+
+        bill.refresh_from_db()
+        fee.refresh_from_db()
+        self.assertEqual(result["skipped_count"], 1)
+        self.assertEqual((bill.interest, bill.total_due), (Decimal("900.00"), Decimal("900.00")))
+        self.assertEqual((fee.amount, fee.paid_amount), (Decimal("900.00"), Decimal("100.00")))
+
+    def test_partially_paid_and_paid_bills_are_skipped(self):
+        partial = self._bill(status="PARTIALLY_PAID", rent_paid=Decimal("100.00"))
+        paid = self._bill(status="PAID", billing_month=date(2026, 9, 1))
+        result, _ = self._preview(partial.pk, paid.pk)
+        reasons = {row["bill_id"]: row["reason"] for row in result["skipped"]}
+        self.assertIn("Partially paid", reasons[partial.pk])
+        self.assertIn("Paid bills", reasons[paid.pk])
+        self.assertFalse(LogEntry.objects.filter(object_id__in=[str(partial.pk), str(paid.pk)]).exists())
+
+    def test_manual_payment_bill_ids_reference_is_skipped(self):
+        bill = self._bill()
+        ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-LEGACY-REPAIR-PAYMENT",
+            bill_ids=str(bill.pk),
+            amount=Decimal("1.00"),
+            status="PENDING",
+        )
+        result, _ = self._preview(bill.pk)
+        self.assertIn("ManualPayment", result["skipped"][0]["reason"])
+
+    def test_invoice_bill_ids_reference_is_skipped(self):
+        bill = self._bill()
+        BillingInvoice.objects.create(
+            invoice_number="LEGACY-REPAIR-INV-1",
+            tenant=self.tenant,
+            bill_ids=str(bill.pk),
+            amount_paid=Decimal("0.00"),
+        )
+        result, _ = self._preview(bill.pk)
+        self.assertIn("BillingInvoice", result["skipped"][0]["reason"])
+
+    def test_inconsistent_summary_and_future_bill_are_skipped(self):
+        inconsistent = self._bill(total_due=Decimal("12000.00"))
+        future = self._bill(
+            billing_month=date(2026, 11, 1), due_date=date(2026, 11, 1),
+        )
+        result, _ = self._preview(inconsistent.pk, future.pk)
+        reasons = {row["bill_id"]: row["reason"] for row in result["skipped"]}
+        self.assertIn("do not reconcile", reasons[inconsistent.pk])
+        self.assertIn("Future", reasons[future.pk])
+
+    def test_payment_indicators_and_unreached_late_fee_threshold_are_skipped(self):
+        payment_indicator = self._bill(payment_reference="REF-OLD-PAYMENT")
+        not_due = self._bill(
+            billing_month=date(2026, 10, 2),
+            due_date=date(2026, 10, 10),
+        )
+        result, _ = self._preview(payment_indicator.pk, not_due.pk)
+        reasons = {row["bill_id"]: row["reason"] for row in result["skipped"]}
+        self.assertIn("payment indicators", reasons[payment_indicator.pk])
+        self.assertIn("threshold", reasons[not_due.pk])
+
+    def test_dry_run_changes_no_bill_or_audit_log(self):
+        bill = self._bill()
+        before = (bill.interest, bill.total_due, bill.total_balance)
+        result = repair_inflated_unpaid_late_fees(today=self.audit_date)
+        bill.refresh_from_db()
+        self.assertEqual((bill.interest, bill.total_due, bill.total_balance), before)
+        self.assertEqual(result["repaired_count"], 0)
+        self.assertFalse(LogEntry.objects.exists())
+    def test_apply_is_limited_to_selected_ids_and_is_idempotent(self):
+        selected = self._bill()
+        unselected = self._bill(billing_month=date(2026, 9, 1), due_date=date(2026, 9, 1))
+        _, tokens = self._preview(selected.pk, unselected.pk)
+        first = self._apply([selected.pk], tokens)
+        selected.refresh_from_db()
+        unselected.refresh_from_db()
+        self.assertEqual(first["repaired_count"], 1)
+        self.assertEqual(selected.interest, Decimal("315.00"))
+        self.assertEqual(unselected.interest, Decimal("900.00"))
+
+        second = self._apply([selected.pk], tokens)
+        selected.refresh_from_db()
+        self.assertEqual(second["repaired_count"], 0)
+        self.assertEqual(second["skipped_count"], 1)
+        self.assertEqual(selected.interest, Decimal("315.00"))
+        self.assertEqual(LogEntry.objects.filter(object_id=str(selected.pk)).count(), 1)
+
+    def test_stale_preview_is_skipped_after_bill_changes(self):
+        bill = self._bill()
+        _, tokens = self._preview(bill.pk)
+        bill.base_rent = Decimal("11000.00")
+        bill.total_due = Decimal("12600.00")
+        bill.save(update_fields=["base_rent", "total_due"])
+
+        result = self._apply([bill.pk], tokens)
+
+        bill.refresh_from_db()
+        self.assertEqual(result["repaired_count"], 0)
+        self.assertIn("changed since preview", result["skipped"][0]["reason"])
+        self.assertEqual(bill.interest, Decimal("900.00"))
+        self.assertEqual(bill.total_due, Decimal("12600.00"))
+        self.assertFalse(LogEntry.objects.exists())

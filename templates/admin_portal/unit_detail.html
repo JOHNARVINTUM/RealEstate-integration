@@ -1,0 +1,338 @@
+{% extends "admin_portal/base.html" %}
+{% load humanize %}
+{% load static %}
+
+{% block title %}Unit {{ unit.number }} Details | Real Estate Administration{% endblock %}
+
+{% block content %}
+<div class="unit-detail-wrapper max-w-7xl mx-auto font-sans text-slate-900 space-y-6 pb-12 px-2 sm:px-4 lg:px-6">
+  
+  <!-- Navigation: Consistent Back Button -->
+  <nav class="flex items-center justify-between gap-4 pt-4 sm:pt-6">
+    <a href="{{ back_url }}" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-xs group">
+      <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+      </svg>
+      <span>Back</span>
+    </a>
+
+    <a href="{{ edit_url }}" class="px-5 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-lg text-sm font-extrabold transition-colors shadow-xs">
+      Edit Details
+    </a>
+  </nav>
+
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+    
+    <!-- Left Column: Media & Core Info -->
+    <div class="lg:col-span-8 space-y-8">
+      
+      <!-- Photo Showcase -->
+      <section class="bg-white border border-slate-200 rounded-[2rem] overflow-hidden shadow-sm relative group">
+        
+        <div class="relative h-96 sm:h-[480px] bg-slate-100 overflow-hidden">
+          {% if unit_images %}
+            {% for unit_image in unit_images %}
+              <div class="carousel-slide absolute inset-0 transition-opacity duration-700 ease-in-out {% if forloop.first %}opacity-100 active{% else %}opacity-0{% endif %}" data-slide="{{ forloop.counter0 }}">
+                <img src="{{ unit_image.image.url }}" alt="Room Photo" class="w-full h-full object-cover">
+                
+                {% if unit_image.caption %}
+                  <div class="absolute bottom-0 inset-x-0 bg-gradient-to-t from-slate-900/90 to-transparent p-8 pt-16">
+                    <p class="text-base font-bold text-white">{{ unit_image.caption }}</p>
+                  </div>
+                {% endif %}
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class="absolute inset-0 flex flex-col items-center justify-center text-slate-400 p-8 text-center bg-slate-50">
+              <div class="w-20 h-20 bg-white border-2 border-slate-200 rounded-3xl flex items-center justify-center mb-4 shadow-sm">
+                <svg class="w-10 h-10 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                </svg>
+              </div>
+              <span class="text-lg font-black text-slate-600 block">No photos yet</span>
+              <p class="text-sm text-slate-500 mt-2 font-medium">Add photos to help tenants visualize the room.</p>
+              <a href="{{ edit_url }}" class="mt-4 text-blue-600 font-bold hover:underline">Add Photos Now</a>
+            </div>
+          {% endif %}
+
+          <!-- Status & Unit Info Badges -->
+          <div class="absolute top-6 left-6 flex flex-wrap items-center gap-2">
+            <span class="inline-block px-4 py-2 backdrop-blur-md rounded-full text-[10px] font-black uppercase tracking-widest shadow-xl border
+              {% if display_status_label == 'Pending Payment' %}bg-sky-500/90 text-white border-sky-400/30
+              {% elif display_status_label == 'Available' %}bg-emerald-500/90 text-white border-emerald-400/30 flex items-center gap-1.5
+              {% elif display_status_label == 'Occupied' %}bg-indigo-600/90 text-white border-indigo-400/30
+              {% elif display_status_label == 'Under Maintenance' %}bg-amber-500/90 text-white border-amber-400/30
+              {% else %}bg-slate-800/90 text-white border-slate-700/30{% endif %}">
+              {% if display_status_label == 'Available' %}<span class="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>{% endif %}{{ display_status_label }}
+            </span>
+            
+            <span class="inline-block px-4 py-2 bg-white/90 backdrop-blur-md text-slate-900 border border-white/50 rounded-full text-[10px] font-black uppercase tracking-widest shadow-xl text-slate-900 rounded-xl text-xs font-black uppercase tracking-widest shadow-xl">
+              Unit {{ unit.number }}
+            </span>
+          </div>
+
+          <!-- Carousel Controls -->
+          {% if unit_images|length > 1 %}
+            <div class="absolute inset-y-0 inset-x-4 flex items-center justify-between pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity">
+              <button onclick="previousSlide()" class="pointer-events-auto w-12 h-12 rounded-[2rem] bg-white/95 hover:bg-white text-slate-800 flex items-center justify-center shadow-2xl border border-slate-100 transition-all active:scale-95" title="Previous">
+                <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M15 19l-7-7 7-7"></path></svg>
+              </button>
+              <button onclick="nextSlide()" class="pointer-events-auto w-12 h-12 rounded-[2rem] bg-white/95 hover:bg-white text-slate-800 flex items-center justify-center shadow-2xl border border-slate-100 transition-all active:scale-95" title="Next">
+                <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M9 5l7 7-7 7"></path></svg>
+              </button>
+            </div>
+            
+            <!-- Indicators -->
+            <div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-2 z-20">
+              {% for unit_image in unit_images %}
+                <div class="w-2.5 h-2.5 rounded-full bg-white/40 border border-white/20 transition-all {% if forloop.first %}bg-white w-6{% endif %}" data-indicator="{{ forloop.counter0 }}"></div>
+              {% endfor %}
+            </div>
+          {% endif %}
+        </div>
+      </section>
+
+      <!-- Room Details & Features -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        
+        <!-- Quick Information -->
+        <div class="bg-white border border-slate-200 rounded-[2rem] p-8 sm:p-10 shadow-sm hover:shadow-lg transition-shadow">
+          <h3 class="text-sm font-black uppercase tracking-wider text-slate-500 mb-6 flex items-center gap-3">
+            <span class="w-2 h-2 rounded-full bg-slate-900"></span>
+            Room Information
+          </h3>
+          
+          <div class="grid grid-cols-2 gap-y-8 gap-x-4">
+            <div>
+              <span class="text-xs font-black text-slate-400 uppercase tracking-widest block mb-1">Room Type</span>
+              <strong class="text-lg font-black text-slate-900 block leading-tight">{{ unit.get_unit_type_display }}</strong>
+            </div>
+            <div>
+              <span class="text-xs font-black text-slate-400 uppercase tracking-widest block mb-1">Floor Level</span>
+              <strong class="text-lg font-black text-slate-900 block leading-tight">Floor {{ unit.floor_level }}</strong>
+            </div>
+            <div>
+              <span class="text-xs font-black text-slate-400 uppercase tracking-widest block mb-1">Total Size</span>
+              <strong class="text-lg font-black text-slate-900 block leading-tight">{{ unit.size_sqm|floatformat:0 }} SQM</strong>
+            </div>
+            <div>
+              <span class="text-xs font-black text-slate-400 uppercase tracking-widest block mb-1">Room ID</span>
+              <strong class="text-lg font-black text-slate-900 block leading-tight">#{{ unit.id }}</strong>
+            </div>
+          </div>
+
+          {% if unit.description %}
+            <div class="mt-10 pt-6 border-t-2 border-slate-50">
+              <span class="text-xs font-black text-slate-400 uppercase tracking-widest block mb-3">Room Description</span>
+              <p class="text-base text-slate-700 leading-relaxed font-bold">
+                {{ unit.description }}
+              </p>
+            </div>
+          {% endif %}
+        </div>
+
+        <!-- Amenities -->
+        <div class="bg-white border border-slate-200 rounded-[2rem] p-8 sm:p-10 shadow-sm hover:shadow-lg transition-shadow">
+          <h3 class="text-sm font-black uppercase tracking-wider text-slate-500 mb-6 flex items-center gap-3">
+            <span class="w-2 h-2 rounded-full bg-slate-900"></span>
+            Features & Amenities
+          </h3>
+          
+          {% if amenities_list %}
+            <div class="grid grid-cols-1 gap-3">
+              {% for amenity in amenities_list %}
+                <div class="px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl text-sm font-black text-slate-800 flex items-center gap-3">
+                  <svg class="w-5 h-5 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path>
+                  </svg>
+                  <span>{{ amenity }}</span>
+                </div>
+              {% endfor %}
+            </div>
+          {% else %}
+            <div class="py-12 text-center">
+              <div class="w-16 h-16 bg-slate-50 border border-slate-100 rounded-[2rem] flex items-center justify-center mx-auto mb-4 text-slate-300">
+                <svg class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+              </div>
+              <span class="text-sm font-black text-slate-500">No amenities listed for this room.</span>
+            </div>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- Current Tenant Info -->
+      <section class="bg-white border border-slate-200 rounded-[2rem] p-8 sm:p-10 shadow-sm hover:shadow-lg transition-shadow">
+        <h3 class="text-sm font-black uppercase tracking-wider text-slate-500 mb-6 flex items-center gap-3">
+          <span class="w-2 h-2 rounded-full bg-slate-900"></span>
+          Occupancy Status
+        </h3>
+
+        {% if current_tenant %}
+          <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
+            <div class="flex items-center gap-5">
+              <div class="w-16 h-16 rounded-full bg-indigo-900 border-4 border-white text-white flex items-center justify-center text-2xl font-black shadow-lg">
+                {{ current_tenant.email|first|upper }}
+              </div>
+              
+              <div>
+                <strong class="text-xl font-black text-slate-900 block leading-tight">
+                  {{ current_tenant.tenantprofile.full_name|default:current_tenant.email }}
+                </strong>
+                <span class="text-sm text-slate-500 font-bold mt-1 block">Current Tenant</span>
+                
+                <div class="flex items-center gap-3 mt-3">
+                  <span class="px-3 py-1 bg-emerald-100 text-emerald-800 rounded-lg text-[10px] font-black uppercase tracking-wider">Reliable Tenant</span>
+                  <span class="px-3 py-1 bg-blue-100 text-blue-800 rounded-lg text-[10px] font-black uppercase tracking-wider">Active Lease</span>
+                </div>
+              </div>
+            </div>
+
+            <a href="{% url 'admin_tenant_detail' current_tenant.tenantprofile.id %}" 
+               class="px-6 py-3 bg-white border-2 border-slate-200 hover:bg-slate-50 text-slate-800 rounded-xl font-black text-sm transition-all shadow-sm active:scale-95 whitespace-nowrap">
+              View Profile
+            </a>
+          </div>
+        {% elif pending_tenant %}
+          <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
+            <div class="flex items-center gap-5">
+              <div class="w-16 h-16 rounded-full bg-sky-900 border-4 border-white text-white flex items-center justify-center text-2xl font-black shadow-lg">
+                {{ pending_tenant.email|first|upper }}
+              </div>
+              
+              <div>
+                <strong class="text-xl font-black text-slate-900 block leading-tight">
+                  {{ pending_tenant.tenantprofile.full_name|default:pending_tenant.email }}
+                </strong>
+                <span class="text-sm text-slate-500 font-bold mt-1 block">Pending Tenant</span>
+                
+                <div class="flex items-center gap-3 mt-3">
+                  <span class="px-3 py-1 bg-sky-100 text-sky-800 rounded-lg text-[10px] font-black uppercase tracking-wider">Move-in Payment Pending</span>
+                  <span class="px-3 py-1 bg-slate-100 text-slate-700 rounded-lg text-[10px] font-black uppercase tracking-wider">Lease Not Active</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="flex flex-col sm:flex-row gap-3 w-full sm:w-auto">
+              <a href="{% url 'admin_tenant_detail' pending_tenant.tenantprofile.id %}" 
+                 class="px-6 py-3 bg-white border-2 border-slate-200 hover:bg-slate-50 text-slate-800 rounded-xl font-black text-sm transition-all shadow-sm active:scale-95 whitespace-nowrap text-center">
+                View Profile
+              </a>
+              <a href="{% url 'admin_delete_lease' pending_lease.id %}?next=unit"
+                 class="px-6 py-3 bg-rose-50 border-2 border-rose-200 hover:bg-rose-600 text-rose-700 hover:text-white rounded-xl font-black text-sm transition-all shadow-sm active:scale-95 whitespace-nowrap text-center">
+                Cancel Pending Lease
+              </a>
+            </div>
+          </div>
+        {% else %}
+          <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
+            <div>
+              <strong class="text-xl font-black text-slate-900 block">Room is currently Vacant</strong>
+              <p class="text-base text-slate-500 mt-2 font-bold leading-relaxed">This room is empty and ready for a new tenant.</p>
+            </div>
+
+            <a href="{% url 'admin_create_lease' %}?unit_id={{ unit.id }}" 
+               class="px-8 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-black text-base transition-all shadow-xl active:scale-95 whitespace-nowrap">
+              Assign a Tenant
+            </a>
+          </div>
+        {% endif %}
+      </section>
+    </div>
+
+    <!-- Right Column: Financials & Actions -->
+    <div class="lg:col-span-4 space-y-8">
+      
+      <!-- Financial Card -->
+      <div class="bg-slate-900 border border-slate-800 rounded-[2rem] p-8 sm:p-10 shadow-2xl shadow-indigo-900/20 space-y-8 relative overflow-hidden text-white">
+        <div>
+          <!-- Subtle glow -->
+        <div class="absolute top-0 right-0 -mr-20 -mt-20 w-64 h-64 rounded-full bg-indigo-500/20 blur-3xl pointer-events-none"></div>
+        <div class="relative z-10">
+          <h3 class="text-xs font-black uppercase tracking-widest text-slate-400 mb-2">Monthly Rent</h3>
+          <div class="flex items-baseline gap-2">
+            <strong class="text-4xl font-black text-white tracking-tight">₱{{ unit.monthly_rent|floatformat:0|intcomma }}</strong>
+            <span class="text-base text-slate-500 font-bold uppercase tracking-widest">/ month</span>
+          </div>
+        </div>
+        </div>
+        
+        <div class="space-y-4 relative z-10">
+          {% if unit.status == 'AVAILABLE' %}
+            <a href="{% url 'admin_create_lease' %}?unit_id={{ unit.id }}" 
+               class="block w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-black text-center transition-all shadow-lg active:scale-95">
+              Start New Lease
+            </a>
+          {% endif %}
+        </div>
+      </div>
+
+      {% if not unit.is_active %}
+        <!-- Restore Unit -->
+        <div class="bg-emerald-50 border-2 border-emerald-100 rounded-[2rem] p-8 space-y-4">
+          <h3 class="text-xs font-black uppercase tracking-widest text-emerald-800">Show in List</h3>
+          <p class="text-sm text-emerald-700 font-bold leading-relaxed">
+            This unit is currently hidden. Showing it again will return it to the active list.
+          </p>
+
+          <form method="POST" action="{% url 'admin_restore_unit' unit.id %}" class="confirm-action"
+                data-confirm="Show this unit in the active list again?">
+            {% csrf_token %}
+            <button type="submit"
+                    class="w-full px-8 py-3.5 bg-white hover:bg-emerald-600 text-emerald-700 hover:text-white border-2 border-emerald-200 rounded-xl font-black text-center transition-all shadow-sm select-none active:scale-95">
+              Show this Unit
+            </button>
+          </form>
+        </div>
+      {% endif %}
+
+    </div>
+
+  </div>
+</div>
+
+<script>
+let currentSlideIndex = 0;
+const slides = document.querySelectorAll('.carousel-slide');
+const indicators = document.querySelectorAll('[data-indicator]');
+const totalSlides = slides.length;
+
+function showSlide(index) {
+  if (totalSlides === 0) return;
+  
+  slides.forEach((slide, i) => {
+    slide.style.opacity = (i === index) ? '1' : '0';
+    if (i === index) slide.classList.add('active');
+    else slide.classList.remove('active');
+  });
+
+  indicators.forEach((indicator, i) => {
+    if (i === index) {
+      indicator.classList.remove('bg-white/40', 'w-2.5');
+      indicator.classList.add('bg-white', 'w-6');
+    } else {
+      indicator.classList.add('bg-white/40', 'w-2.5');
+      indicator.classList.remove('bg-white', 'w-6');
+    }
+  });
+}
+
+function nextSlide() {
+  if (totalSlides <= 1) return;
+  currentSlideIndex = (currentSlideIndex + 1) % totalSlides;
+  showSlide(currentSlideIndex);
+}
+
+function previousSlide() {
+  if (totalSlides <= 1) return;
+  currentSlideIndex = (currentSlideIndex - 1 + totalSlides) % totalSlides;
+  showSlide(currentSlideIndex);
+}
+
+// Auto-play
+if (totalSlides > 1) {
+  setInterval(nextSlide, 8000);
+}
+</script>
+{% endblock %}

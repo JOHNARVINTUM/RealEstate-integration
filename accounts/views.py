@@ -1,0 +1,343 @@
+import logging
+import mimetypes
+from django.contrib.auth.views import LoginView, PasswordChangeView
+from django.contrib.auth import update_session_auth_hash
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.forms import PasswordChangeForm
+from django.http import FileResponse, Http404
+from django.shortcuts import get_object_or_404, redirect, render
+from django.db.utils import OperationalError, ProgrammingError
+from django.urls import reverse, reverse_lazy
+from django.contrib import messages
+
+from announcements.models import HomepageBanner, BusinessProfile, LandingPageSection, LandingPageFeature
+from rentals.models import Lease, TenantAttachment, TenantProfile
+
+logger = logging.getLogger(__name__)
+
+
+
+
+def _default_landing_page_content():
+    return {
+        "business_name": "RealEstate360+",
+        "tagline": "Elevating Urban Living",
+        "about_text": "A masterclass in modern living. Affordable, pristine, and perfectly located in the heart of Mandaluyong. We provide a space you can truly call home.",
+        "hero_title": "RealEstate360+",
+        "hero_subtitle": "Property Management, Simplified",
+        "hero_description": "A masterclass in modern living. Affordable, pristine, and perfectly located in the heart of Mandaluyong. We provide a space you can truly call home.",
+        "hero_button_text": "Explore RealEstate360+",
+        "hero_button_url": "#about",
+        "hero_image_url": "",
+        "about_title": "A Foundation Built on Trust",
+        "about_description": "Our spaces are designed to feel modern, welcoming, and dependable for every tenant who calls this property home.",
+        "about_image_url": "",
+        "services_title": "What You Can Expect",
+        "services_description": "Present your strongest property features here, from responsive management to clean shared spaces and reliable billing support.",
+        "service_1_title": "Responsive Support",
+        "service_1_description": "Tenants can report issues, monitor billing, and stay connected through one organized property portal.",
+        "service_1_image_url": "",
+        "service_2_title": "Clean Shared Spaces",
+        "service_2_description": "Highlight the quality of corridors, exteriors, and common areas without changing your current landing page layout.",
+        "service_2_image_url": "",
+        "service_3_title": "Simple Tenant Experience",
+        "service_3_description": "Show prospects that payments, renewals, announcements, and maintenance are handled in one place.",
+        "service_3_image_url": "",
+        "contact_title": "Looking to Inquire?",
+        "contact_description": "We'd love to hear from you. Reach out to our team to learn more about available spaces, schedule a viewing, or ask any questions.",
+        "contact_email": "lod.bituin@yahoo.com",
+        "contact_phone": "09178255935",
+        "address": "91 Coronado, Mandaluyong City, 1550 Metro Manila",
+        "inquiry_text": "We'd love to hear from you. Reach out to our team to learn more about available spaces, schedule a viewing, or ask any questions.",
+        "footer_text": "Crafted with care.",
+    }
+
+
+def _default_business_profile():
+    return _default_landing_page_content().copy()
+
+
+def _build_landing_service_cards(profile_data):
+    cards = []
+    for index in range(1, 4):
+        title = (profile_data.get(f"service_{index}_title") or "").strip()
+        description = (profile_data.get(f"service_{index}_description") or "").strip()
+        if not title and not description:
+            continue
+        cards.append({
+            "title": title,
+            "description": description,
+            "image_url": profile_data.get(f"service_{index}_image_url") or "",
+            "icon_label": f"Service {index}",
+            "is_active": True,
+        })
+    return cards
+
+
+def _build_landing_visual_features(profile_data, service_cards):
+    visuals = []
+    if profile_data.get("hero_image_url"):
+        visuals.append({
+            "title": profile_data.get("hero_title") or "Hero",
+            "image_url": profile_data["hero_image_url"],
+        })
+    return visuals
+
+
+def _get_public_business_profile():
+    defaults = _default_landing_page_content()
+    try:
+        profile = (
+            BusinessProfile.objects.filter(is_active=True)
+            .order_by("-updated_at", "-created_at")
+            .first()
+        ) or BusinessProfile.objects.order_by("-updated_at", "-created_at").first()
+    except (ProgrammingError, OperationalError):
+        profile = None
+
+    if profile is None:
+        return defaults
+
+    return {
+        "business_name": profile.business_name or defaults["business_name"],
+        "tagline": profile.tagline or defaults["tagline"],
+        "about_text": profile.about_text or defaults["about_text"],
+        "hero_title": profile.hero_title or defaults["hero_title"],
+        "hero_subtitle": profile.hero_subtitle or defaults["hero_subtitle"],
+        "hero_description": profile.hero_description or defaults["hero_description"],
+        "hero_button_text": profile.hero_button_text or defaults["hero_button_text"],
+        "hero_button_url": profile.hero_button_url or defaults["hero_button_url"],
+        "hero_image_url": profile.hero_image_url or defaults["hero_image_url"],
+        "about_title": profile.about_title or defaults["about_title"],
+        "about_description": profile.about_description or defaults["about_description"],
+        "about_image_url": profile.about_image_url or defaults["about_image_url"],
+        "services_title": profile.services_title or defaults["services_title"],
+        "services_description": profile.services_description or defaults["services_description"],
+        "service_1_title": profile.service_1_title,
+        "service_1_description": profile.service_1_description,
+        "service_1_image_url": profile.service_1_image_url,
+        "service_2_title": profile.service_2_title,
+        "service_2_description": profile.service_2_description,
+        "service_2_image_url": profile.service_2_image_url,
+        "service_3_title": profile.service_3_title,
+        "service_3_description": profile.service_3_description,
+        "service_3_image_url": profile.service_3_image_url,
+        "contact_title": profile.contact_title or defaults["contact_title"],
+        "contact_description": profile.contact_description or defaults["contact_description"],
+        "contact_email": profile.contact_email or defaults["contact_email"],
+        "contact_phone": profile.contact_phone or defaults["contact_phone"],
+        "address": profile.address or defaults["address"],
+        "inquiry_text": profile.inquiry_text or defaults["inquiry_text"],
+        "footer_text": profile.footer_text or defaults["footer_text"],
+    }
+
+
+class RoleBasedLoginView(LoginView):
+    template_name = "accounts/login.html"
+    redirect_authenticated_user = True
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        try:
+            context["active_banner"] = (
+                HomepageBanner.objects.filter(is_active=True)
+                .order_by("-updated_at", "-created_at")
+                .first()
+            )
+        except (ProgrammingError, OperationalError):
+            context["active_banner"] = None
+        context["business_profile"] = _get_public_business_profile()
+        context["landing_service_cards"] = _build_landing_service_cards(context["business_profile"])
+        context["landing_visual_features"] = _build_landing_visual_features(
+            context["business_profile"],
+            context["landing_service_cards"],
+        )
+        return context
+
+    def get_success_url(self):
+        # If someone hit a protected page, honor ?next=...
+        next_url = self.get_redirect_url()
+        if next_url:
+            return next_url
+
+        user = self.request.user
+        if getattr(user, "role", "") in {"ADMIN", "STAFF"} or user.is_superuser:
+            return reverse("admin_dashboard")   # /admin-portal/dashboard/
+        return reverse("tenant_dashboard")      # change if your tenant view name is different
+
+
+class TenantPasswordChangeView(PasswordChangeView):
+    """
+    Custom password change view for tenants.
+    
+    This view extends Django's PasswordChangeView to:
+    1. Clear the password_change_required flag after successful change
+    2. Update session to prevent logout after password change
+    3. Show success message to user
+    4. Redirect to tenant dashboard
+    
+    This view is used when tenants are forced to change their temporary
+    password on first login.
+    """
+    template_name = "registration/password_change_form.html"
+    success_url = reverse_lazy("tenant_dashboard")
+    
+    def form_valid(self, form):
+        """
+        Process valid password change form.
+        
+        Extends parent behavior to:
+        - Clear password_change_required flag
+        - Update session to prevent logout
+        - Add success message
+        
+        Args:
+            form: Valid PasswordChangeForm instance
+            
+        Returns:
+            HttpResponse: Redirect to success URL
+        """
+        # Call parent to actually change the password
+        response = super().form_valid(form)
+        
+        # Clear the password_change_required flag
+        try:
+            if hasattr(self.request.user, 'tenantprofile'):
+                if self.request.user.tenantprofile.password_change_required:
+                    self.request.user.tenantprofile.password_change_required = False
+                    self.request.user.tenantprofile.save(update_fields=['password_change_required'])
+                    logger.info(
+                        f"Password change completed for tenant {self.request.user.username}, "
+                        f"password_change_required flag cleared"
+                    )
+        except Exception as e:
+            # Log error but don't fail the password change
+            logger.error(
+                f"Failed to clear password_change_required flag for {self.request.user.username}: {e}"
+            )
+        
+        # Update session to prevent logout after password change
+        update_session_auth_hash(self.request, self.request.user)
+        
+        # Add success message
+        messages.success(
+            self.request,
+            "Your password has been updated successfully. Welcome to RealEstate360+!"
+        )
+        
+        return response
+    
+    def form_invalid(self, form):
+        """
+        Handle invalid password change form submission.
+        
+        Adds error message for user feedback.
+        
+        Args:
+            form: Invalid PasswordChangeForm instance
+            
+        Returns:
+            HttpResponse: Rendered form with errors
+        """
+        messages.error(
+            self.request,
+            "Please correct the errors below and try again."
+        )
+        return super().form_invalid(form)
+
+
+def _is_admin_user(user):
+    return getattr(user, "role", "") in {"ADMIN", "STAFF"} or user.is_superuser or user.is_staff
+
+
+def _styled_password_form(user, data=None):
+    form = PasswordChangeForm(user=user, data=data)
+    input_class = (
+        "w-full rounded-2xl border-2 border-slate-200 bg-white px-4 py-3 "
+        "text-base font-bold text-slate-900 outline-none transition "
+        "focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
+    )
+    for field in form.fields.values():
+        field.widget.attrs.update({"class": input_class})
+    return form
+
+
+@login_required
+def account_profile(request):
+    user = request.user
+    tenant_profile = TenantProfile.objects.filter(user=user).first()
+    active_lease = (
+        Lease.objects.select_related("unit")
+        .filter(tenant=user, status=Lease.STATUS_ACTIVE)
+        .order_by("-start_date", "-id")
+        .first()
+    )
+    latest_lease = active_lease or (
+        Lease.objects.select_related("unit")
+        .filter(tenant=user)
+        .order_by("-start_date", "-id")
+        .first()
+    )
+    attachments = (
+        TenantAttachment.objects.select_related("uploaded_by")
+        .filter(tenant=user)
+        .order_by("-uploaded_at")
+        if tenant_profile
+        else TenantAttachment.objects.none()
+    )
+
+    if request.method == "POST":
+        password_form = _styled_password_form(user, request.POST)
+        if password_form.is_valid():
+            password_form.save()
+            update_session_auth_hash(request, user)
+            messages.success(request, "Your password has been updated successfully.")
+            return redirect("account_profile")
+        messages.error(request, "Please correct the password fields and try again.")
+    else:
+        password_form = _styled_password_form(user)
+
+    display_name = (
+        tenant_profile.full_name
+        if tenant_profile
+        else (user.get_full_name() or user.username or user.email)
+    )
+    role_label = user.get_role_display() if hasattr(user, "get_role_display") else getattr(user, "role", "User")
+    template_name = "accounts/profile_admin.html" if _is_admin_user(user) else "accounts/profile_tenant.html"
+
+    return render(
+        request,
+        template_name,
+        {
+            "display_name": display_name,
+            "tenant_profile": tenant_profile,
+            "latest_lease": latest_lease,
+            "active_lease": active_lease,
+            "attachments": attachments,
+            "password_form": password_form,
+            "role_label": role_label,
+        },
+    )
+
+
+@login_required
+def account_profile_attachment(request, attachment_id: int):
+    attachment = get_object_or_404(
+        TenantAttachment.objects.select_related("tenant"),
+        pk=attachment_id,
+    )
+    if not _is_admin_user(request.user) and attachment.tenant_id != request.user.id:
+        raise Http404("Attachment not found.")
+    if not attachment.file:
+        raise Http404("Attachment file is not available.")
+
+    content_type = mimetypes.guess_type(attachment.filename)[0] or "application/octet-stream"
+    try:
+        attachment.file.open("rb")
+    except (FileNotFoundError, OSError):
+        raise Http404("Attachment file is not available.")
+
+    response = FileResponse(attachment.file, content_type=content_type)
+    response["Content-Disposition"] = f'attachment; filename="{attachment.filename}"'
+    response["X-Content-Type-Options"] = "nosniff"
+    return response

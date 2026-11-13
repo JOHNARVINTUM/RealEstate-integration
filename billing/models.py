@@ -1,0 +1,300 @@
+from django.db import models
+from django.utils import timezone
+
+
+class MonthlyBill(models.Model):
+    STATUS_CHOICES = [
+        ("UNPAID", "Unpaid"),
+        ("PARTIALLY_PAID", "Partially Paid"),
+        ("PAID", "Paid"),
+    ]
+    
+    BILL_TYPE_CHOICES = [
+        ("RENT", "Rent"),
+        ("WATER", "Water"),
+        ("PENALTY", "Penalty"),
+    ]
+
+    lease = models.ForeignKey("rentals.Lease", on_delete=models.CASCADE, related_name="monthly_bills")
+    billing_month = models.DateField()  # recommended: month-start date (e.g., 2026-02-01)
+    due_date = models.DateField(null=True, blank=True)
+    bill_type = models.CharField(max_length=20, choices=BILL_TYPE_CHOICES, default="RENT")
+
+    base_rent = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    water_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    interest = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    total_due = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="UNPAID")
+    paid_at = models.DateTimeField(null=True, blank=True)
+    payment_reference = models.CharField(max_length=80, blank=True, default="")
+    
+    parking_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0, help_text="Monthly parking fee (0 if no parking)")
+
+    # NEW: Partial payment tracking for rent/water separation
+    rent_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    water_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    parking_paid = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    rent_paid_at = models.DateTimeField(null=True, blank=True)
+    water_paid_at = models.DateTimeField(null=True, blank=True)
+    
+    # NEW: Water computation audit (safe additive change)
+    water_computed_from_system = models.BooleanField(
+        default=False,
+        help_text="True if water_amount was computed from WaterReading system"
+    )
+    # Optional FK to source reading for traceability
+    source_water_reading = models.ForeignKey(
+        "water.WaterReading",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="generated_monthly_bills"
+    )
+
+    class Meta:
+        unique_together = ("lease", "billing_month")
+        ordering = ("-billing_month",)
+        indexes = [
+            models.Index(
+                fields=["lease", "status", "billing_month"],
+                name="bill_lease_stat_month_idx",
+            ),
+            models.Index(
+                fields=["status", "due_date"],
+                name="bill_stat_due_idx",
+            ),
+            models.Index(
+                fields=["billing_month"],
+                name="bill_month_idx",
+            ),
+            models.Index(
+                fields=["status", "billing_month"],
+                name="bill_stat_month_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.lease} - {self.billing_month} ({self.status})"
+
+    def _line_item_amounts(self, line_type):
+        line_items = getattr(self, "_prefetched_objects_cache", {}).get("line_items")
+        if line_items is not None:
+            for line in line_items:
+                if line.line_type == line_type:
+                    return line.amount, line.paid_amount
+            return 0, 0
+
+        line = self.line_items.filter(line_type=line_type).only("amount", "paid_amount").first()
+        if not line:
+            return 0, 0
+        return line.amount, line.paid_amount
+
+    @property
+    def maintenance_amount(self):
+        amount, _ = self._line_item_amounts(BillLineItem.LINE_TYPE_MAINTENANCE)
+        return amount
+
+    @property
+    def maintenance_paid(self):
+        _, paid_amount = self._line_item_amounts(BillLineItem.LINE_TYPE_MAINTENANCE)
+        return paid_amount
+
+    @property
+    def maintenance_balance(self):
+        return max(self.maintenance_amount - self.maintenance_paid, 0)
+
+    @property
+    def parking_balance(self):
+        """Remaining parking fee to pay"""
+        return max(self.parking_fee - self.parking_paid, 0)
+
+    @property
+    def rent_balance(self):
+        """Remaining rent amount to pay"""
+        return max(self.base_rent - self.rent_paid, 0)
+    
+    @property
+    def water_balance(self):
+        """Remaining water amount to pay"""
+        return max(self.water_amount - self.water_paid, 0)
+
+    @property
+    def interest_balance(self):
+        """Remaining unpaid late fee, falling back to the legacy summary field."""
+        line_items = getattr(self, "_prefetched_objects_cache", {}).get("line_items")
+        if line_items is not None:
+            for line in line_items:
+                if line.line_type == BillLineItem.LINE_TYPE_LATE_FEE:
+                    return line.balance
+            if self.status == "PAID":
+                return 0
+            return max(self.interest or 0, 0)
+
+        late_fee = self.line_items.filter(
+            line_type=BillLineItem.LINE_TYPE_LATE_FEE,
+        ).only("amount", "paid_amount").first()
+        if late_fee:
+            return late_fee.balance
+        if self.status == "PAID":
+            return 0
+        return max(self.interest or 0, 0)
+    
+    @property
+    def total_balance(self):
+        """Total unpaid balance, sourced from bill lines when they exist."""
+        line_items = getattr(self, "_prefetched_objects_cache", {}).get("line_items")
+        if line_items is None:
+            line_items = list(self.line_items.all())
+        if line_items:
+            return sum((line.balance for line in line_items), 0)
+        if self.status == "PAID":
+            return 0
+        if self.base_rent == 0 and self.water_amount == 0 and self.total_due > 0:
+            return max(self.total_due - (self.rent_paid + self.water_paid + self.parking_paid + self.maintenance_paid), 0)
+        return self.rent_balance + self.water_balance + self.parking_balance + self.maintenance_balance + self.interest_balance
+    
+    @property
+    def is_rent_paid(self):
+        """Check if rent is fully paid"""
+        return self.rent_paid >= self.base_rent if self.base_rent > 0 else True
+    
+    @property
+    def is_water_paid(self):
+        """Check if water is fully paid"""
+        return self.water_paid >= self.water_amount if self.water_amount > 0 else True
+    
+    @property
+    def payment_status(self):
+        """Detailed payment status"""
+        if self.status == "PAID":
+            return "FULLY_PAID"
+        if self.is_rent_paid and self.is_water_paid and (self.base_rent > 0 or self.water_amount > 0):
+            return "FULLY_PAID"
+        elif self.is_rent_paid and self.base_rent > 0:
+            return "RENT_PAID_WATER_PENDING"
+        elif self.is_water_paid and self.water_amount > 0:
+            return "WATER_PAID_RENT_PENDING"
+        else:
+            return "PARTIALLY_PAID" if (self.rent_paid > 0 or self.water_paid > 0 or self.status == "PARTIALLY_PAID") else "UNPAID"
+
+    @property
+    def billing_state(self):
+        """Computed billing state for ledger display. No DB column."""
+        if self.status == "PAID" or (self.total_balance == 0 and self.status not in ("UNPAID", "PARTIALLY_PAID")):
+            return "PAID"
+        today = timezone.localdate()
+        current_month = today.replace(day=1)
+        bill_month = self.billing_month.replace(day=1)
+        if bill_month > current_month:
+            return "UPCOMING"
+        if bill_month == current_month:
+            return "DUE"
+        return "OVERDUE"
+
+
+class BillLineItem(models.Model):
+    LINE_TYPE_RENT = "RENT"
+    LINE_TYPE_PARKING = "PARKING"
+    LINE_TYPE_WATER = "WATER"
+    LINE_TYPE_LATE_FEE = "LATE_FEE"
+    LINE_TYPE_SECURITY_DEPOSIT = "SECURITY_DEPOSIT"
+    LINE_TYPE_CONTRACT_DEPOSIT = "CONTRACT_DEPOSIT"
+    LINE_TYPE_MAINTENANCE = "MAINTENANCE"
+
+    LINE_TYPE_CHOICES = [
+        (LINE_TYPE_RENT, "Rent"),
+        (LINE_TYPE_PARKING, "Parking"),
+        (LINE_TYPE_WATER, "Water"),
+        (LINE_TYPE_LATE_FEE, "Late Fee"),
+        (LINE_TYPE_SECURITY_DEPOSIT, "Security Deposit"),
+        (LINE_TYPE_CONTRACT_DEPOSIT, "Contract Deposit"),
+        (LINE_TYPE_MAINTENANCE, "Maintenance"),
+    ]
+
+    STATUS_UNPAID = "UNPAID"
+    STATUS_PARTIAL = "PARTIAL"
+    STATUS_PAID = "PAID"
+
+    STATUS_CHOICES = [
+        (STATUS_UNPAID, "Unpaid"),
+        (STATUS_PARTIAL, "Partial"),
+        (STATUS_PAID, "Paid"),
+    ]
+
+    monthly_bill = models.ForeignKey(MonthlyBill, on_delete=models.CASCADE, related_name="line_items")
+    line_type = models.CharField(max_length=30, choices=LINE_TYPE_CHOICES)
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_UNPAID)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    payment_reference = models.CharField(max_length=80, blank=True, default="")
+    source_water_reading = models.ForeignKey(
+        "water.WaterReading",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="billing_line_items",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("monthly_bill", "line_type")
+        ordering = ("monthly_bill", "line_type")
+        indexes = [
+            models.Index(fields=["monthly_bill", "line_type"], name="line_bill_type_idx"),
+            models.Index(fields=["line_type", "status"], name="line_type_status_idx"),
+        ]
+
+    @property
+    def balance(self):
+        return max(self.amount - self.paid_amount, 0)
+
+    def refresh_status(self):
+        if self.amount <= 0:
+            self.status = self.STATUS_PAID
+        elif self.paid_amount >= self.amount:
+            self.status = self.STATUS_PAID
+        elif self.paid_amount > 0:
+            self.status = self.STATUS_PARTIAL
+        else:
+            self.status = self.STATUS_UNPAID
+        return self.status
+
+    def __str__(self):
+        return f"{self.monthly_bill_id} - {self.line_type} ({self.status})"
+
+
+class BillingInvoice(models.Model):
+    invoice_number = models.CharField(max_length=40, unique=True)
+    tenant = models.ForeignKey("accounts.User", on_delete=models.CASCADE, related_name="billing_invoices")
+    payment = models.OneToOneField(
+        "payments.ManualPayment",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoice",
+    )
+    bill_ids = models.CharField(max_length=255, blank=True, default="")
+    reference_code = models.CharField(max_length=80, blank=True, default="")
+    payment_method = models.CharField(max_length=30, blank=True, default="")
+    payment_type = models.CharField(max_length=30, blank=True, default="")
+    amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    snapshot = models.JSONField(default=dict, blank=True)
+    email_sent = models.BooleanField(default=False)
+    emailed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(fields=["tenant", "created_at"], name="invoice_tenant_created_idx"),
+            models.Index(fields=["reference_code"], name="invoice_ref_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.invoice_number} - {self.tenant.email}"
+
+
+

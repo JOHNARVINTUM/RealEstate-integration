@@ -1,0 +1,632 @@
+{% extends "admin_portal/base.html" %}
+{% load humanize %}
+{% block title %}Water Utility Console | Real Estate Administration{% endblock %}
+
+{% block content %}
+<div class="water-management-wrapper w-full mx-auto font-sans text-slate-900 space-y-4 pb-6 px-2 sm:px-4 lg:px-6 py-4">
+  
+  <!-- Studio Top Title Block -->
+  <header class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
+    <div>
+      <div class="flex items-center gap-2 mb-1">
+        <span class="inline-block w-3 h-3 rounded-full bg-cyan-600"></span>
+        <span class="text-sm font-semibold text-slate-700">{% if is_staff_portal %}Water Readings{% else %}Manage Water{% endif %}</span>
+      </div>
+      <h1 class="text-3xl md:text-4xl font-extrabold tracking-tight text-slate-900 leading-tight">Water Usage</h1>
+      <p class="text-base text-slate-700 mt-1 leading-relaxed">{% if is_staff_portal %}Record water usage and generate reading-based charges for the selected month.{% else %}Track how much water units use, set the price per cubic meter, and record meter readings.{% endif %}</p>
+    </div>
+  </header>
+
+  <!-- Summary Metric Overview Cards (Consistent Iconless Layout) -->
+  <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+    
+    <!-- Total Units -->
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-blue-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-xs sm:text-sm font-bold text-slate-700 block mb-1">Units with Water</span>
+        <div class="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">{{ total_units }}</div>
+      </div>
+      <div class="text-xs sm:text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-blue-600 font-bold">●</span> Active units mapped
+      </div>
+    </div>
+
+    <!-- Completed Submissions -->
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-emerald-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-xs sm:text-sm font-bold text-slate-700 block mb-1">Readings Added</span>
+        <div class="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">{{ filled_count }}</div>
+      </div>
+      <div class="text-xs sm:text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-emerald-600 font-bold">●</span> Readings recorded
+      </div>
+    </div>
+
+    <!-- Missing Submissions -->
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-rose-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-xs sm:text-sm font-bold text-slate-700 block mb-1">Still Missing</span>
+        <div class="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">{{ missing_count }}</div>
+      </div>
+      <div class="text-xs sm:text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-rose-600 font-bold">●</span> Require input entry
+      </div>
+    </div>
+
+    <!-- Active Base Rate -->
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-indigo-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-xs sm:text-sm font-bold text-slate-700 block mb-1">Price per m³</span>
+        <div class="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">
+          {% if current_rate %}₱{{ current_rate }}{% else %}<span class="text-slate-400 font-bold text-base">Unassigned</span>{% endif %}
+        </div>
+      </div>
+      <div class="text-xs sm:text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-indigo-600 font-bold">●</span> Calculation factor
+      </div>
+    </div>
+
+  </section>
+
+  <!-- Configuration & Timeline Top Row -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      
+      {% if not is_staff_portal %}
+      <!-- Water Rate Settings Box -->
+      <details class="bg-white border border-slate-200 rounded-xl shadow-xs group">
+        <summary class="flex cursor-pointer list-none items-center justify-between gap-4 p-6">
+          <div>
+            <h2 class="text-base font-extrabold text-slate-900 tracking-tight">Water Price</h2>
+            <p class="text-xs text-slate-600 mt-0.5">
+              Current: {% if current_rate %}&#8369;{{ current_rate }} / m3{% else %}Unassigned{% endif %}
+              · Pump &#8369;{{ shared_pump_total|default:'0.00' }} · VAT {{ vat_percent|default:'12.00' }}%
+            </p>
+          </div>
+          <span class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-black text-slate-700 group-open:hidden">Edit</span>
+          <span class="hidden rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-black text-slate-700 group-open:inline-block">Close</span>
+        </summary>
+
+        <form method="post" action="{% url 'admin_water_rate' %}" class="space-y-4 border-t border-slate-100 p-6">
+          {% csrf_token %}
+          <input type="hidden" name="settings_month" value="{{ year }}-{{ month|stringformat:'02d' }}-01">
+          <div>
+            <label class="block text-xs font-bold text-slate-800 mb-1">Effective Timestamp <span class="text-rose-600">*</span></label>
+            <input type="date" name="effective_date" class="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-900 focus:ring-2 focus:ring-slate-500 outline-none" value="{{ today|date:'Y-m-d' }}" required>
+          </div>
+          
+          <div>
+            <label class="block text-xs font-bold text-slate-800 mb-1">Price (₱ per m³) <span class="text-rose-600">*</span></label>
+            <div class="relative">
+              <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-sm">₱</span>
+              <input type="number" name="rate_per_cu_m" class="w-full bg-white border border-slate-300 rounded-lg pl-7 pr-3 py-2 text-sm font-bold text-slate-900 focus:ring-2 focus:ring-slate-500 outline-none" step="0.01" min="0" value="{{ current_rate|default:'45.00' }}" required>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-xs font-bold text-slate-800 mb-1">Shared Pump Total</label>
+            <div class="relative">
+              <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-sm">₱</span>
+              <input type="number" name="shared_pump_total" class="w-full bg-white border border-slate-300 rounded-lg pl-7 pr-3 py-2 text-sm font-bold text-slate-900 focus:ring-2 focus:ring-slate-500 outline-none" step="0.01" min="0" value="{{ shared_pump_total|default:'0.00' }}">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-xs font-bold text-slate-800 mb-1">VAT Percent</label>
+            <div class="relative">
+              <input type="number" name="vat_percent" class="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 pr-8 text-sm font-bold text-slate-900 focus:ring-2 focus:ring-slate-500 outline-none" step="0.01" min="0" value="{{ vat_percent|default:'12.00' }}">
+              <span class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-sm">%</span>
+            </div>
+          </div>
+          
+          <div>
+            <label class="block text-xs font-bold text-slate-800 mb-1">Operational Description</label>
+            <input type="text" name="notes" class="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-900 focus:ring-2 focus:ring-slate-500 outline-none" placeholder="e.g. Standard Summer baseline">
+          </div>
+          
+          <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white font-extrabold py-2.5 rounded-lg text-sm transition-colors text-center shadow-xs">
+            Save Price
+          </button>
+        </form>
+      </details>
+      {% endif %}
+
+      <!-- Scope Timeline Selection Box -->
+      <div class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-4">
+        <div class="pb-3 border-b border-slate-100">
+          <h2 class="text-base font-extrabold text-slate-900 tracking-tight">Timeline Selection Scope</h2>
+          <p class="text-xs text-slate-600 mt-0.5">Filter targets by active logging bounds</p>
+        </div>
+
+        <form method="get" class="space-y-4">
+          {% if search %}
+            <input type="hidden" name="search" value="{{ search }}">
+          {% endif %}
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-[11px] font-bold text-slate-700 mb-1">Target Month</label>
+              <select name="month" class="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-900 focus:ring-2 focus:ring-slate-500 outline-none cursor-pointer">
+                {% for m_num, m_name in month_choices %}
+                  <option value="{{ m_num }}" {% if month == m_num %}selected{% endif %}>{{ m_name }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            
+            <div>
+              <label class="block text-[11px] font-bold text-slate-700 mb-1">Target Year</label>
+              <select name="year" class="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-900 focus:ring-2 focus:ring-slate-500 outline-none cursor-pointer">
+                {% for y in year_choices %}
+                  <option value="{{ y }}" {% if year == y %}selected{% endif %}>{{ y }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+          
+          <button type="submit" class="w-full bg-white hover:bg-slate-50 border border-slate-300 text-slate-800 font-extrabold py-2.5 rounded-lg text-sm transition-colors text-center shadow-2xs">
+            Load Assigned Readings
+          </button>
+        </form>
+      </div>
+
+  </div>
+
+  <!-- Right Target Execution Data Workspace Column -->
+  <div class="space-y-4">
+      
+      <!-- Missing Constant System Alert Banner -->
+      {% if not current_rate %}
+      <div class="bg-rose-50 border border-rose-200 rounded-xl p-4 flex items-start gap-3">
+        <span class="w-6 h-6 rounded bg-rose-100 text-rose-800 font-extrabold flex items-center justify-center shrink-0 text-xs">!</span>
+        <div class="space-y-0.5">
+          <strong class="text-sm font-extrabold text-rose-900 block">Water Price Not Set</strong>
+          <p class="text-xs text-rose-700 leading-relaxed">Please set the water price in the settings on the left before adding readings.</p>
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- Core Master Bounded Container -->
+      <div class="bg-white border border-slate-200 rounded-xl shadow-xs overflow-hidden">
+        
+        <!-- Table Scope Top Navigation Section -->
+        <div class="p-5 border-b border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-slate-50/50">
+          <div>
+            <h2 class="text-xl font-black text-slate-900">{{ month_name }} {{ year }} Sub-Meter Index</h2>
+            <p class="text-sm text-slate-600 mt-1">
+              Input current total values to automatically project sum dues
+              {% if search %}
+                <span class="block mt-1 text-xs font-bold text-slate-500">Filtered by: <span class="text-slate-900">{{ search }}</span></span>
+              {% endif %}
+            </p>
+          </div>
+          
+          <div class="flex flex-col sm:flex-row items-center gap-3 w-full sm:w-auto">
+            <!-- View Options Dropdown -->
+            <div class="relative group w-full sm:w-auto">
+              <button type="button" class="w-full sm:w-auto flex items-center justify-center gap-2 bg-white border border-slate-300 rounded-lg px-4 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 transition-colors shadow-xs">
+                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                </svg>
+                Columns
+              </button>
+              <div class="absolute right-0 top-full mt-2 w-48 bg-white border border-slate-200 rounded-xl shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50 p-2 flex flex-col gap-0.5">
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-last" checked>
+                  <span class="text-sm font-bold text-slate-700">Last (m³)</span>
+                </label>
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-current" checked>
+                  <span class="text-sm font-bold text-slate-700">Current (m³)</span>
+                </label>
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-usage" checked>
+                  <span class="text-sm font-bold text-slate-700">Usage</span>
+                </label>
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-rate" checked>
+                  <span class="text-sm font-bold text-slate-700">Rate</span>
+                </label>
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-pump-rate" checked>
+                  <span class="text-sm font-bold text-slate-700">Pump Rate</span>
+                </label>
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-pump-price" checked>
+                  <span class="text-sm font-bold text-slate-700">Pump Price</span>
+                </label>
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-price" checked>
+                  <span class="text-sm font-bold text-slate-700">Price</span>
+                </label>
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-status" checked>
+                  <span class="text-sm font-bold text-slate-700">Status</span>
+                </label>
+                <label class="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                  <input type="checkbox" class="col-toggle rounded text-slate-800 focus:ring-slate-500 w-4 h-4" value="col-ref" checked>
+                  <span class="text-sm font-bold text-slate-700">Reference</span>
+                </label>
+              </div>
+            </div>
+            
+            <form method="get" class="w-full sm:w-auto relative min-w-[220px]">
+              <input type="hidden" name="month" value="{{ month }}">
+              <input type="hidden" name="year" value="{{ year }}">
+              <input type="text" name="search" value="{{ search }}" placeholder="Filter unit identifier or string..." 
+                     class="w-full pl-8 {% if search %}pr-20{% else %}pr-3{% endif %} py-2 bg-white border border-slate-300 rounded-lg text-sm font-medium text-slate-900 focus:ring-2 focus:ring-slate-500 transition-all outline-none">
+              <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400">
+                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                </svg>
+              </span>
+              {% if search %}
+                <a href="?month={{ month }}&year={{ year }}"
+                   class="absolute right-2 top-1/2 -translate-y-1/2 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-slate-600 hover:bg-white hover:text-slate-900">
+                  Clear
+                </a>
+              {% endif %}
+            </form>
+          </div>
+        </div>
+
+        <!-- Master Records Injection Loop Form -->
+        <form method="post" action="{% url 'admin_water_process' %}">
+          {% csrf_token %}
+          <input type="hidden" name="month" value="{{ month }}">
+          <input type="hidden" name="year" value="{{ year }}">
+
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse">
+              <thead>
+                <tr class="bg-slate-50 border-b border-slate-200">
+                  <th class="px-4 py-3.5 text-sm font-extrabold text-slate-700 whitespace-nowrap">Tenant & Room</th>
+                  <th class="col-last px-4 py-3.5 text-sm font-extrabold text-slate-700 text-right whitespace-nowrap">Last (m³)</th>
+                  <th class="col-current px-4 py-3.5 text-sm font-extrabold text-slate-700 whitespace-nowrap">Current (m³)</th>
+                  <th class="col-usage px-4 py-3.5 text-sm font-extrabold text-slate-700 text-right whitespace-nowrap">Usage</th>
+                  <th class="col-rate px-4 py-3.5 text-sm font-extrabold text-slate-700 text-right whitespace-nowrap">Rate</th>
+                  <th class="col-pump-rate px-4 py-3.5 text-sm font-extrabold text-slate-700 text-right whitespace-nowrap">Pump Rate</th>
+                  <th class="col-pump-price px-4 py-3.5 text-sm font-extrabold text-slate-700 text-right whitespace-nowrap">Pump Price</th>
+                  <th class="col-price px-4 py-3.5 text-sm font-extrabold text-slate-700 text-right whitespace-nowrap">Price</th>
+                  <th class="col-status px-4 py-3.5 text-sm font-extrabold text-slate-700 text-center whitespace-nowrap">Status</th>
+                  <th class="col-ref px-4 py-3.5 text-sm font-extrabold text-slate-700 whitespace-nowrap">Reference</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-200 text-sm" id="water-table-body">
+                {% for row in readings_data %}
+                <tr class="reading-row hover:bg-slate-50 transition-colors group {% if row.has_reading %}bg-emerald-50/40{% else %}bg-white{% endif %}" data-lease="{{ row.lease_id }}">
+                  <input type="hidden" name="lease_ids" value="{{ row.lease_id }}">
+                  
+                  <td class="px-4 py-3">
+                    <div class="flex items-center gap-3.5">
+                      <div class="w-10 h-10 rounded bg-slate-100 group-hover:bg-slate-800 group-hover:text-white flex items-center justify-center text-slate-800 font-bold text-base shrink-0 border border-slate-200 transition-colors">
+                        {{ row.tenant_name|first|upper }}
+                      </div>
+                      <div class="w-[130px] shrink-0">
+                        <div class="font-extrabold text-slate-900 text-base leading-tight">#{{ row.unit_number }}</div>
+                        <div class="text-sm font-medium text-slate-600 truncate leading-tight">{{ row.tenant_name }}</div>
+                      </div>
+                      {% if row.is_first_billing %}
+                        <span class="px-2 py-1 rounded bg-slate-900 text-white font-extrabold text-[10px] shrink-0 uppercase select-none tracking-wide">Initial</span>
+                      {% endif %}
+                    </div>
+                  </td>
+
+                  <td class="col-last px-4 py-3 text-right font-mono font-bold text-slate-600 text-sm">
+                    {{ row.previous_reading|floatformat:2 }}
+                  </td>
+
+                  <td class="col-current px-4 py-3">
+                    <input type="number" 
+                           name="reading_{{ row.lease_id }}" 
+                           class="w-24 bg-white border border-slate-300 rounded px-2.5 py-1.5 text-sm font-extrabold text-slate-900 focus:ring-2 focus:ring-slate-500 outline-none text-right transition-all reading-input" 
+                           value="{{ row.current_reading|default:'' }}"
+                           step="0.01"
+                           min="0"
+                           placeholder="0.00"
+                           {% if row.has_reading or row.bill_paid %}readonly{% endif %}
+                           data-previous="{{ row.previous_reading }}"
+                           data-rate="{{ rate }}"
+                           data-shared-pump="{{ shared_pump_total }}"
+                           data-vat-percent="{{ vat_percent }}"
+                           oninput="calculateRow(this)">
+                  </td>
+
+                  <td class="col-usage px-4 py-3 text-right font-mono font-extrabold text-slate-800 text-sm">
+                    <span class="usage-display" id="usage_{{ row.lease_id }}">
+                      {% if row.has_reading %}{{ row.usage|floatformat:2 }}{% else %}-{% endif %}
+                    </span>
+                  </td>
+
+                  <td class="col-rate px-4 py-3 text-right font-mono font-bold text-slate-700 text-sm">
+                    &#8369;{{ row.rate_used|floatformat:2 }}
+                  </td>
+
+                  <td class="col-pump-rate px-4 py-3 text-right font-mono font-bold text-slate-800 text-sm">
+                    <span class="pump-display" id="pump_{{ row.lease_id }}">
+                      {% if row.has_reading %}{{ row.usage_share_percent|floatformat:2 }}%{% else %}-{% endif %}
+                    </span>
+                  </td>
+
+                  <td class="col-pump-price px-4 py-3 text-right font-mono font-bold text-slate-800 text-sm">
+                    <span class="pump-price-display" id="pump_price_{{ row.lease_id }}">
+                      {% if row.has_reading %}&#8369;{{ row.shared_pump_amount|floatformat:2|intcomma }}{% else %}-{% endif %}
+                    </span>
+                  </td>
+
+                  <td class="col-price px-4 py-3 text-right">
+                    <strong class="amount-display text-slate-900 font-black text-base" id="amount_{{ row.lease_id }}">
+                      {% if row.has_reading %}&#8369;{{ row.amount|intcomma }}{% else %}-{% endif %}
+                    </strong>
+                  </td>
+
+                  <td class="col-status px-4 py-3 text-center">
+                    {% if row.bill_paid %}
+                      <span class="px-2 py-1 rounded bg-emerald-100 text-emerald-800 font-extrabold text-[10px] uppercase block select-none tracking-wide">Paid</span>
+                    {% elif row.has_reading %}
+                      <span class="px-2 py-1 rounded bg-slate-100 text-slate-900 font-extrabold text-[10px] uppercase block select-none tracking-wide">Done</span>
+                    {% else %}
+                      <span class="px-2 py-1 rounded bg-rose-100 text-rose-800 font-extrabold text-[10px] uppercase block select-none tracking-wide">Pending</span>
+                    {% endif %}
+                  </td>
+
+                  <td class="col-ref px-4 py-3 font-bold text-slate-600 text-sm">
+                    {{ row.reference|default:"-" }}
+                  </td>
+
+                </tr>
+                {% empty %}
+                <tr>
+                  <td colspan="10" class="py-8 text-center bg-white">
+                    <strong class="text-sm text-slate-600 block">No target unit bindings configured for this timestamp scope.</strong>
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Pagination Controls -->
+          <div id="pagination-controls" class="p-4 flex flex-col sm:flex-row items-center justify-between border-t border-slate-200 bg-white gap-3 hidden">
+             <div class="text-xs text-slate-600 font-medium">
+               Showing <span id="page-start" class="font-bold">0</span> to <span id="page-end" class="font-bold">0</span> of <span id="total-rows" class="font-bold">0</span> entries
+             </div>
+             <div class="flex gap-1.5">
+               <button type="button" id="prev-page" class="px-3 py-1.5 border border-slate-300 rounded text-xs font-bold text-slate-700 bg-white hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">Prev</button>
+               <div id="page-numbers" class="flex gap-1.5 hidden sm:flex"></div>
+               <button type="button" id="next-page" class="px-3 py-1.5 border border-slate-300 rounded text-xs font-bold text-slate-700 bg-white hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">Next</button>
+             </div>
+          </div>
+
+          <!-- Bottom Execution Action Trigger Strip -->
+          <div class="p-5 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3">
+            <span class="text-xs text-slate-600 font-medium text-center sm:text-left leading-relaxed">
+              Consumptions scale automatically relative to the currently active valuation baseline factor.
+            </span>
+            <div class="w-full sm:w-auto flex flex-col sm:flex-row gap-2">
+              {% if not is_staff_portal %}
+              <a href="{% url 'admin_water_export_csv' %}?month={{ month }}&year={{ year }}&search={{ search|urlencode }}" data-skip-loader download class="w-full sm:w-auto bg-white hover:bg-slate-100 border border-slate-300 text-slate-800 font-extrabold px-6 py-2.5 rounded-lg text-sm transition-colors text-center shadow-xs shrink-0">
+                Export CSV
+              </a>
+              {% endif %}
+              <button type="submit" class="w-full sm:w-auto bg-slate-800 hover:bg-slate-900 text-white font-extrabold px-6 py-2.5 rounded-lg text-sm transition-colors text-center shadow-xs shrink-0" {% if not current_rate %}disabled{% endif %}>
+                Save & Create Bills
+              </button>
+            </div>
+          </div>
+
+        </form>
+      </div>
+
+      {% if not is_staff_portal %}
+      <!-- Advanced Recomputation Execution Link -->
+      <div class="flex justify-end pt-2">
+        <form method="post" action="{% url 'admin_water_recompute' %}" class="confirm-action inline-block" data-confirm="Recompute all water readings for {{ month_name }} {{ year }}? This will recalculate usage and amounts based on the latest rate.">
+          {% csrf_token %}
+          <input type="hidden" name="month" value="{{ month }}">
+          <input type="hidden" name="year" value="{{ year }}">
+          <button type="submit" class="text-xs font-bold text-slate-600 hover:text-slate-900 transition-colors underline bg-transparent border-none p-0 cursor-pointer">
+            Force Entire Timeline Recalculation Override
+          </button>
+        </form>
+      </div>
+      {% endif %}
+
+    </div>
+
+</div>
+
+<!-- Real-Time Client Sum Recalculation Engine -->
+<script>
+  function calculateRow(input) {
+    const current = parseFloat(input.value) || 0;
+    const previous = parseFloat(input.dataset.previous) || 0;
+    const rate = parseFloat(input.dataset.rate) || 0;
+    const leaseId = input.name.replace('reading_', '');
+    const row = input.closest('tr');
+    
+    if (input.value !== '') {
+      const usage = Math.max(0, current - previous);
+      const amount = usage * rate;
+      
+      document.getElementById('usage_' + leaseId).textContent = usage.toFixed(2);
+      document.getElementById('amount_' + leaseId).textContent = '₱' + amount.toLocaleString('en-PH', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      
+      // Update row styling to active record
+      row.classList.add('bg-emerald-50/40');
+      row.classList.remove('bg-white');
+    } else {
+      document.getElementById('usage_' + leaseId).textContent = '-';
+      document.getElementById('amount_' + leaseId).textContent = '-';
+      row.classList.remove('bg-emerald-50/40');
+      row.classList.add('bg-white');
+    }
+  }
+
+  function recalculateWaterPreview() {
+    const inputs = Array.from(document.querySelectorAll('.reading-input'));
+
+    inputs.forEach(input => {
+      if (input.readOnly) return;
+
+      const current = parseFloat(input.value) || 0;
+      const previous = parseFloat(input.dataset.previous) || 0;
+      const leaseId = input.name.replace('reading_', '');
+      const row = input.closest('tr');
+
+      if (input.value !== '') {
+        const usage = Math.max(0, current - previous);
+
+        document.getElementById('usage_' + leaseId).textContent = usage.toFixed(2);
+        document.getElementById('pump_' + leaseId).textContent = '% on save';
+        document.getElementById('pump_price_' + leaseId).textContent = 'On save';
+        document.getElementById('amount_' + leaseId).textContent = 'On save';
+        row.classList.add('bg-emerald-50/40');
+        row.classList.remove('bg-white');
+      } else {
+        document.getElementById('usage_' + leaseId).textContent = '-';
+        document.getElementById('pump_' + leaseId).textContent = '-';
+        document.getElementById('pump_price_' + leaseId).textContent = '-';
+        document.getElementById('amount_' + leaseId).textContent = '-';
+        row.classList.remove('bg-emerald-50/40');
+        row.classList.add('bg-white');
+      }
+    });
+  }
+
+  function calculateRow(input) {
+    recalculateWaterPreview();
+  }
+
+  // Frontend Pagination Logic
+  document.addEventListener("DOMContentLoaded", function() {
+    const rowsPerPage = 10;
+    let currentPage = 1;
+    const tableBody = document.getElementById('water-table-body');
+    if (!tableBody) return;
+    
+    const rows = Array.from(tableBody.querySelectorAll('tr.reading-row'));
+    const totalRows = rows.length;
+
+    if (totalRows > 0) {
+      document.getElementById('pagination-controls').classList.remove('hidden');
+      recalculateWaterPreview();
+      renderTable();
+    }
+
+    function renderTable() {
+        const start = (currentPage - 1) * rowsPerPage;
+        const end = start + rowsPerPage;
+        
+        rows.forEach((row, index) => {
+            if (index >= start && index < end) {
+                row.style.display = '';
+            } else {
+                row.style.display = 'none';
+            }
+        });
+        
+        document.getElementById('page-start').textContent = start + 1;
+        document.getElementById('page-end').textContent = Math.min(end, totalRows);
+        document.getElementById('total-rows').textContent = totalRows;
+        
+        renderPagination();
+    }
+
+    function renderPagination() {
+        const totalPages = Math.ceil(totalRows / rowsPerPage);
+        const pageNumbers = document.getElementById('page-numbers');
+        pageNumbers.innerHTML = '';
+        
+        let startPage = Math.max(1, currentPage - 2);
+        let endPage = Math.min(totalPages, currentPage + 2);
+        
+        for (let i = startPage; i <= endPage; i++) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = i;
+            btn.className = `px-3 py-1.5 border rounded text-xs font-bold transition-colors ${i === currentPage ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'}`;
+            btn.onclick = () => {
+                currentPage = i;
+                renderTable();
+            };
+            pageNumbers.appendChild(btn);
+        }
+        
+        document.getElementById('prev-page').disabled = currentPage === 1;
+        document.getElementById('next-page').disabled = currentPage === totalPages;
+    }
+
+    document.getElementById('prev-page')?.addEventListener('click', () => {
+        if (currentPage > 1) {
+            currentPage--;
+            renderTable();
+        }
+    });
+
+    document.getElementById('next-page')?.addEventListener('click', () => {
+        const totalPages = Math.ceil(totalRows / rowsPerPage);
+        if (currentPage < totalPages) {
+            currentPage++;
+            renderTable();
+        }
+    });
+
+    // Prevent full bill generation if no water bill reading is provided
+    const processForm = document.querySelector(`form[action="{% url 'admin_water_process' %}"]`);
+    if (processForm) {
+      processForm.addEventListener('submit', function() {
+        const rows = document.querySelectorAll('tr.reading-row');
+        rows.forEach(row => {
+          const readingInput = row.querySelector('.reading-input');
+          const leaseInput = row.querySelector('input[name="lease_ids"]');
+          // Disable the lease ID field if there is no water reading, so backend ignores it
+          if (readingInput && (readingInput.value === '' || readingInput.value === null)) {
+            if (leaseInput) {
+              leaseInput.disabled = true;
+            }
+          }
+        });
+      });
+    }
+  });
+</script>
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const checkboxes = document.querySelectorAll('.col-toggle');
+    
+    // Load saved preferences from localStorage
+    const savedCols = JSON.parse(localStorage.getItem('waterTableCols') || '{}');
+    
+    checkboxes.forEach(cb => {
+      const colClass = cb.value;
+      
+      // Initialize state from saved or default to checked
+      if (savedCols[colClass] !== undefined) {
+        cb.checked = savedCols[colClass];
+      }
+      
+      // Apply initial state
+      toggleColumn(colClass, cb.checked);
+      
+      // Handle changes
+      cb.addEventListener('change', (e) => {
+        toggleColumn(colClass, e.target.checked);
+        
+        // Save to localStorage
+        savedCols[colClass] = e.target.checked;
+        localStorage.setItem('waterTableCols', JSON.stringify(savedCols));
+      });
+    });
+    
+    function toggleColumn(colClass, isVisible) {
+      const elements = document.querySelectorAll('.' + colClass);
+      elements.forEach(el => {
+        if (isVisible) {
+          el.classList.remove('hidden');
+        } else {
+          el.classList.add('hidden');
+        }
+      });
+    }
+  });
+</script>
+
+{% endblock %}

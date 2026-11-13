@@ -1,0 +1,4668 @@
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
+from io import BytesIO
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from unittest.mock import PropertyMock, patch
+from zipfile import ZipFile
+from dateutil.relativedelta import relativedelta
+from PIL import Image
+
+from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
+from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.urls import reverse
+from django.utils import timezone
+
+from accounts.models import User
+from announcements.models import Announcement, BusinessProfile, HomepageBanner, LandingPageFeature, LandingPageSection
+from accounts.admin_forecasting_views import _build_forecasting_context
+from accounts.admin_notification_views import resolve_notification_target_url
+from accounts.admin_portal_forms import ComprehensiveTenantEditForm, LeaseForm, TenantProfileForm
+from billing.models import BillLineItem, MonthlyBill
+from billing.services import ensure_current_month_bill_for_lease
+from maintenance.models import MaintenanceRequest
+from payments.models import ManualPayment
+from rentals.models import ArchivedTenant, Lease, LeaseContractEvent, Notification, TenantAttachment, TenantProfile, Unit
+from rentals.storage import SupabaseStorage
+from rentals.notification_copy import (
+    move_in_payment_notification_copy,
+    tenant_account_updated_notification_copy,
+)
+from rentals import notification_copy
+from water.models import WaterRate, WaterReading
+
+
+class SecretKeySettingsTests(TestCase):
+    """Keep production secret validation independent from local settings."""
+
+    project_root = Path(__file__).resolve().parent.parent
+
+    def _import_settings(self, module, **environment):
+        env = os.environ.copy()
+        env.update(environment)
+        return subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            cwd=self.project_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_production_settings_require_secret_key(self):
+        result = self._import_settings(
+            "RealEstateDemo.settings",
+            ENVIRONMENT="production",
+            SECRET_KEY="",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Production SECRET_KEY is missing", result.stderr)
+
+    def test_local_settings_remain_usable_without_secret_key(self):
+        result = self._import_settings(
+            "RealEstateDemo.settings_local",
+            ENVIRONMENT="local",
+            SECRET_KEY="",
+            LOCAL_DB_NAME="local_settings_test",
+            LOCAL_DB_USER="local_settings_user",
+            LOCAL_DB_PASSWORD="local-settings-test-password",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class AdminNotificationCopyTests(SimpleTestCase):
+    def test_move_in_payment_copy_keeps_details_on_separate_lines(self):
+        title, message = move_in_payment_notification_copy(
+            tenant_name="Alex Tenant",
+            amount=Decimal("45700.00"),
+            payment_method="GCash",
+            reference="REF-PM-F1526FC4",
+        )
+
+        self.assertEqual(title, "Move-in payment received")
+        self.assertEqual(
+            message,
+            "Alex Tenant's move-in payment of ₱45,700.00 was successfully received via GCash.\n"
+            "Lease activated · First month's bill is paid.\n"
+            "Payment reference: REF-PM-F1526FC4",
+        )
+
+    def test_account_update_copy_separates_summary_from_specific_action(self):
+        title, message = tenant_account_updated_notification_copy(
+            tenant_name="Alex Tenant",
+            changed_fields=["password"],
+        )
+
+        self.assertEqual(title, "Account updated")
+        self.assertEqual(
+            message,
+            "An administrator updated Alex Tenant's account information.\nUpdated: Password",
+        )
+
+    def test_all_other_notification_copy_builders_are_concise_and_retain_details(self):
+        cases = [
+            (notification_copy.payment_submitted_notification_copy(
+                tenant_name="Alex Tenant", amount=Decimal("1200"), method="GCash", reference="REF-1",
+            ), "Payment submitted", ("Alex Tenant", "₱1,200.00", "GCash", "REF-1")),
+            (notification_copy.cash_payment_scheduled_notification_copy(
+                tenant_name="Alex Tenant", amount=Decimal("1200"), schedule="June 4 at 1 PM", reference="REF-2",
+            ), "Cash payment requested", ("Alex Tenant", "₱1,200.00", "REF-2", "Please confirm")),
+            (notification_copy.payment_approved_notification_copy(
+                payment_method="GCash", amount=Decimal("1200"),
+            ), "Payment received", ("GCash", "₱1,200.00", "balance has been updated")),
+            (notification_copy.payment_declined_notification_copy(
+                payment_method="cash", amount=Decimal("1200"),
+            ), "Payment needs attention", ("cash", "₱1,200.00", "could not be approved")),
+            (notification_copy.online_payment_received_notification_copy(
+                tenant_name="Alex Tenant", amount=Decimal("1200"), method="Gcash", reference="REF-3",
+            ), "Online payment received", ("Alex Tenant", "₱1,200.00", "GCash", "REF-3", "marked as paid")),
+            (notification_copy.cash_appointment_confirmed_notification_copy(
+                amount=Decimal("1200"), schedule="June 4, 2026",
+            ), "Cash payment appointment confirmed", ("₱1,200.00", "June 4, 2026", "exact amount")),
+            (notification_copy.cash_appointment_rescheduled_notification_copy(
+                amount=Decimal("1200"), old_schedule="June 4", new_schedule="June 5",
+                reference="REF-4", admin_note="Please arrive at 1 PM.",
+            ), "Cash payment appointment updated", ("June 4", "June 5", "REF-4", "Please arrive")),
+            (notification_copy.maintenance_request_received_notification_copy(
+                tenant_name="Alex Tenant", category="Plumbing", title="Leaking sink", unit_number="A-2",
+            ), "Maintenance request received", ("Maintenance request: Leaking sink", "Alex Tenant", "Unit A-2")),
+            (notification_copy.maintenance_review_notification_copy(
+                review_status="ACCEPTED", title="Leaking sink", unit_number="A-2", assigned_staff="Sam",
+            ), "Maintenance request accepted", ("Leaking sink", "Unit: A-2", "Sam")),
+            (notification_copy.maintenance_review_notification_copy(
+                review_status="REJECTED", title="Leaking sink", unit_number="A-2", note="Please add a photo.",
+            ), "Maintenance request update", ("Leaking sink", "Please add a photo")),
+            (notification_copy.maintenance_review_notification_copy(
+                review_status="PENDING", title="Leaking sink", unit_number="A-2",
+            ), "Maintenance request under review", ("Leaking sink", "Unit: A-2")),
+            (notification_copy.maintenance_assignment_notification_copy(
+                request_id=7, title="Leaking sink", tenant_name="Alex Tenant", unit_number="A-2",
+            ), "Maintenance request assigned", ("request to work on", "Request number: 7", "Alex Tenant", "A-2")),
+            (notification_copy.maintenance_resolved_notification_copy(
+                staff_name="Sam", request_id=7, title="Leaking sink", tenant_name="Alex Tenant",
+                unit_number="A-2", completed_by="Sam",
+            ), "Maintenance work marked complete", ("resolved", "Request number: 7", "Alex Tenant", "Completed by: Sam")),
+            (notification_copy.repair_estimate_notification_copy(
+                staff_name="Sam", request_id=7, title="Leaking sink", tenant_name="Alex Tenant",
+                unit_number="A-2", amount=Decimal("625"), is_update=True,
+            ), "Repair estimate updated", ("Sam updated", "Request number: 7", "₱625.00")),
+            (notification_copy.maintenance_schedule_notification_copy(
+                title="Leaking sink", decision="APPROVED", visit_time="June 5 at 1 PM", unit_number="A-2",
+            ), "Maintenance visit updated", ("has been confirmed", "June 5 at 1 PM", "Unit: A-2")),
+            (notification_copy.pending_lease_welcome_notification_copy(
+                unit="A-2", security_deposit=Decimal("12000"),
+                total_move_in_cost=Decimal("48000"), start_date="June 1, 2026",
+            ), "Your lease for Unit A-2 is ready", ("Your move-in payment is still pending", "Move-in payment", "₱48,000.00", "Lease starts", "June 1, 2026", "Security deposit", "₱12,000.00 · Due upon move-in")),
+            (notification_copy.activated_lease_welcome_notification_copy(
+                unit="A-2", monthly_rent=Decimal("12000"), start_date="June 1, 2026", due_day=5,
+            ), "Lease active for Unit A-2", ("payment is confirmed", "₱12,000.00", "June 1, 2026", "portal is ready")),
+            (notification_copy.tenant_added_notification_copy(
+                tenant_name="Alex Tenant", email="alex@example.com",
+            ), "Tenant added: Alex Tenant", ("Alex Tenant", "alex@example.com", "sent by email")),
+            (notification_copy.unit_created_notification_copy(
+                unit_number="A-2", unit_type="Studio",
+            ), "Unit added", ("A-2", "Studio", "ready to be managed")),
+        ]
+
+        for (title, message), expected_title, expected_fragments in cases:
+            with self.subTest(title=expected_title):
+                self.assertEqual(title, expected_title)
+                for fragment in expected_fragments:
+                    self.assertIn(fragment, message)
+
+
+class AdminMonthlyBillingFilterTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="billing-filter-admin@example.com",
+            username="billingfilteradmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.paid_tenant = User.objects.create_user(
+            email="billing-filter-paid@example.com",
+            username="billingfilterpaid",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.unpaid_tenant = User.objects.create_user(
+            email="billing-filter-unpaid@example.com",
+            username="billingfilterunpaid",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        current_month = timezone.localdate().replace(day=1)
+        paid_lease = Lease.objects.create(
+            tenant=self.paid_tenant,
+            unit=Unit.objects.create(number="FLT-PAID"),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+            monthly_rent=Decimal("10000.00"),
+            start_date=current_month,
+        )
+        unpaid_lease = Lease.objects.create(
+            tenant=self.unpaid_tenant,
+            unit=Unit.objects.create(number="FLT-UNPAID"),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+            monthly_rent=Decimal("12000.00"),
+            start_date=current_month,
+        )
+        self.paid_bill = MonthlyBill.objects.create(
+            lease=paid_lease,
+            billing_month=current_month,
+            base_rent=Decimal("10000.00"),
+            total_due=Decimal("10000.00"),
+            rent_paid=Decimal("10000.00"),
+            status="PAID",
+        )
+        self.unpaid_bill = MonthlyBill.objects.create(
+            lease=unpaid_lease,
+            billing_month=current_month,
+            base_rent=Decimal("12000.00"),
+            total_due=Decimal("12000.00"),
+            status="UNPAID",
+        )
+        self.month_value = current_month.strftime("%Y-%m")
+        self.client.force_login(self.admin)
+
+    def test_paid_bills_are_the_default_filter(self):
+        response = self.client.get(reverse("admin_billed_this_month"), {"month": self.month_value})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["payment_filter"], "paid")
+        self.assertEqual([bill.id for bill in response.context["bills"]], [self.paid_bill.id])
+        self.assertContains(response, 'name="payment_status"')
+        self.assertContains(response, '<option value="paid" selected>Paid</option>')
+
+    def test_unpaid_filter_shows_outstanding_bills(self):
+        response = self.client.get(
+            reverse("admin_billed_this_month"),
+            {"month": self.month_value, "payment_status": "unpaid"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["payment_filter"], "unpaid")
+        self.assertEqual([bill.id for bill in response.context["bills"]], [self.unpaid_bill.id])
+        self.assertEqual(response.context["table_grand_total"], Decimal("12000.00"))
+        self.assertContains(response, "Unpaid Bills Breakdown")
+        self.assertContains(response, "Outstanding")
+
+
+class AdminUnpaidBillsKpiTests(TestCase):
+    target_month = date(2026, 9, 1)
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="unpaid-kpi-admin@example.com",
+            username="unpaidkpiadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.client.force_login(self.admin)
+
+        self.unpaid_bill = self._make_bill(
+            "KPI-A", "unpaid-kpi-a@example.com", self.target_month,
+            status="UNPAID", rent=Decimal("10000.00"), rent_paid=Decimal("1000.00"),
+            water=Decimal("400.00"), water_paid=Decimal("100.00"),
+            parking=Decimal("600.00"), parking_paid=Decimal("200.00"),
+            interest=Decimal("500.00"), interest_paid=Decimal("125.00"),
+        )
+        self.second_unpaid_bill = self._make_bill(
+            "KPI-B", "unpaid-kpi-b@example.com", self.target_month,
+            status="UNPAID", rent=Decimal("2000.00"),
+        )
+        self.paid_bill = self._make_bill(
+            "KPI-P", "unpaid-kpi-paid@example.com", self.target_month,
+            status="PAID", rent=Decimal("3000.00"), rent_paid=Decimal("3000.00"),
+            interest=Decimal("50.00"),
+        )
+        self.partial_bill = self._make_bill(
+            "KPI-Q", "unpaid-kpi-partial@example.com", self.target_month,
+            status="PARTIALLY_PAID", rent=Decimal("800.00"), rent_paid=Decimal("200.00"),
+        )
+        self.other_month_bill = self._make_bill(
+            "KPI-O", "unpaid-kpi-other-month@example.com", date(2026, 8, 1),
+            status="UNPAID", rent=Decimal("5000.00"),
+        )
+
+    def _make_bill(
+        self, unit_number, email, billing_month, *, status, rent, rent_paid=Decimal("0.00"),
+        water=Decimal("0.00"), water_paid=Decimal("0.00"),
+        parking=Decimal("0.00"), parking_paid=Decimal("0.00"),
+        interest=Decimal("0.00"), interest_paid=Decimal("0.00"),
+    ):
+        tenant = User.objects.create_user(
+            email=email,
+            username=email.split("@")[0],
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        lease = Lease.objects.create(
+            tenant=tenant,
+            unit=Unit.objects.create(number=unit_number),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+            monthly_rent=rent,
+            start_date=date(2026, 1, 1),
+        )
+        bill = MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=billing_month,
+            base_rent=rent,
+            water_amount=water,
+            parking_fee=parking,
+            interest=interest,
+            total_due=rent + water + parking + interest,
+            rent_paid=rent_paid,
+            water_paid=water_paid,
+            parking_paid=parking_paid,
+            status=status,
+        )
+        for line_type, amount, paid_amount in (
+            (BillLineItem.LINE_TYPE_RENT, rent, rent_paid),
+            (BillLineItem.LINE_TYPE_WATER, water, water_paid),
+            (BillLineItem.LINE_TYPE_PARKING, parking, parking_paid),
+            (BillLineItem.LINE_TYPE_LATE_FEE, interest, interest_paid),
+        ):
+            if amount:
+                BillLineItem.objects.create(
+                    monthly_bill=bill,
+                    line_type=line_type,
+                    amount=amount,
+                    paid_amount=paid_amount,
+                )
+        return bill
+
+    def _get_unpaid_response(self):
+        return self.client.get(
+            reverse("admin_billed_this_month"),
+            {"month": "2026-09", "payment_status": "unpaid"},
+        )
+
+    def test_unpaid_kpis_match_the_table_outstanding_balances(self):
+        response = self._get_unpaid_response()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["total_rent"], Decimal("11000.00"))
+        self.assertEqual(response.context["total_water"], Decimal("300.00"))
+        self.assertEqual(response.context["total_parking"], Decimal("400.00"))
+        self.assertEqual(response.context["total_interest"], Decimal("375.00"))
+        self.assertEqual(response.context["grand_total"], Decimal("12075.00"))
+        self.assertEqual(response.context["total_rent"], response.context["table_total_rent"])
+        self.assertEqual(response.context["total_water"], response.context["table_total_water"])
+        self.assertEqual(response.context["total_parking"], response.context["table_total_parking"])
+        self.assertEqual(response.context["total_interest"], response.context["table_total_interest"])
+        self.assertEqual(response.context["grand_total"], response.context["table_grand_total"])
+        self.assertContains(response, "Total Outstanding")
+        self.assertContains(response, "Outstanding Interest")
+        self.assertNotContains(response, "Total Collected")
+
+    def test_unpaid_table_population_and_month_scope_are_unchanged(self):
+        response = self._get_unpaid_response()
+
+        self.assertEqual(
+            {bill.pk for bill in response.context["bills"]},
+            {self.unpaid_bill.pk, self.second_unpaid_bill.pk},
+        )
+        self.assertNotIn(self.paid_bill, response.context["bills"])
+        self.assertNotIn(self.partial_bill, response.context["bills"])
+        self.assertNotIn(self.other_month_bill, response.context["bills"])
+        self.assertEqual(response.context["table_grand_total"], Decimal("12075.00"))
+
+    def test_paid_view_keeps_its_existing_collection_kpi_calculation(self):
+        response = self.client.get(
+            reverse("admin_billed_this_month"),
+            {"month": "2026-09", "payment_status": "paid"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["total_rent"], Decimal("4200.00"))
+        self.assertEqual(response.context["total_water"], Decimal("100.00"))
+        self.assertEqual(response.context["total_parking"], Decimal("200.00"))
+        self.assertEqual(response.context["total_interest"], Decimal("50.00"))
+        self.assertEqual(response.context["grand_total"], Decimal("4550.00"))
+        self.assertContains(response, "Total Collected")
+
+
+class AdminBillingPrioritizationTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="priority-admin@example.com",
+            username="priorityadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.today = timezone.localdate()
+        self.current_month = self.today.replace(day=1)
+        self.client.force_login(self.admin)
+
+    def _bill(self, suffix, *, due_date, status, rent_paid=Decimal("0.00")):
+        tenant = User.objects.create_user(
+            email=f"priority-{suffix}@example.com",
+            username=f"priority{suffix}",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=tenant,
+            first_name="Priority",
+            last_name=suffix,
+            password_change_required=False,
+            created_by=self.admin,
+        )
+        lease = Lease.objects.create(
+            tenant=tenant,
+            unit=Unit.objects.create(number=f"PR-{suffix}"),
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=self.current_month,
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        return MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=self.current_month,
+            due_date=due_date,
+            base_rent=Decimal("10000.00"),
+            total_due=Decimal("10000.00"),
+            rent_paid=rent_paid,
+            status=status,
+        )
+
+    def test_rent_and_bills_page_uses_compact_tablet_layout(self):
+        response = self.client.get(reverse("admin_billing"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Track rent, payments, and outstanding balances at a glance.")
+        self.assertContains(response, 'class="billing-summary-grid')
+        self.assertContains(response, 'class="billing-table-scroll custom-scrollbar"')
+        self.assertContains(response, "min-width: 1080px")
+        self.assertContains(response, 'name="month"')
+        self.assertContains(response, 'name="year"')
+        self.assertContains(response, 'name="status"')
+
+    def test_default_current_month_queue_includes_and_prioritizes_all_states(self):
+        late = self._bill("01", due_date=self.today - timedelta(days=1), status="UNPAID")
+        unpaid = self._bill("02", due_date=self.today, status="UNPAID")
+        partial = self._bill(
+            "03",
+            due_date=self.today + timedelta(days=1),
+            status="PARTIALLY_PAID",
+            rent_paid=Decimal("1000.00"),
+        )
+        paid = self._bill(
+            "04",
+            due_date=self.today + timedelta(days=2),
+            status="PAID",
+            rent_paid=Decimal("10000.00"),
+        )
+
+        response = self.client.get(reverse("admin_billing"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [bill.id for bill in response.context["page_obj"]],
+            [late.id, unpaid.id, partial.id, paid.id],
+        )
+        self.assertEqual(response.context["overdue_count"], 1)
+        self.assertEqual(response.context["unpaid_count"], 1)
+        self.assertEqual(response.context["partial_count"], 1)
+        self.assertEqual(response.context["paid_count"], 1)
+        self.assertEqual(response.context["current_bills_count"], 4)
+
+    def test_status_filter_and_search_preserve_operational_scope(self):
+        paid = self._bill(
+            "11",
+            due_date=self.today,
+            status="PAID",
+            rent_paid=Decimal("10000.00"),
+        )
+        self._bill("12", due_date=self.today, status="UNPAID")
+
+        response = self.client.get(
+            reverse("admin_billing"),
+            {"status": "PAID", "q": "priority-11"},
+        )
+
+        self.assertEqual([bill.id for bill in response.context["page_obj"]], [paid.id])
+        self.assertEqual(response.context["paid_count"], 1)
+        self.assertEqual(response.context["current_bills_count"], 1)
+
+
+class AdminContractLedgerPresentationTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="ledger-admin@example.com",
+            username="ledgeradmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.tenant = User.objects.create_user(
+            email="ledger-display@example.com",
+            username="ledgerdisplay",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.profile = TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Ledger",
+            last_name="Display",
+            password_change_required=False,
+            created_by=self.admin,
+        )
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=Unit.objects.create(number="LCD-101"),
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+            activated_at=timezone.now(),
+        )
+        self.client.force_login(self.admin)
+
+    def test_confirmed_move_in_event_is_shown_separately_from_payment_submissions(self):
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            lease=self.lease,
+            payment_type="move_in",
+            payment_method="CASH",
+            amount=Decimal("30000.00"),
+            reference_code="REF-CONTRACT-EVENT",
+            status="APPROVED",
+            approved_at=timezone.now(),
+        )
+        LeaseContractEvent.objects.create(
+            lease=self.lease,
+            source_payment=payment,
+            event_type=LeaseContractEvent.EVENT_TYPE_MOVE_IN_PAYMENT,
+            status=LeaseContractEvent.STATUS_APPROVED,
+            occurred_at=payment.approved_at,
+            payment_reference=payment.reference_code,
+            payment_method=payment.payment_method,
+            amount=payment.amount,
+        )
+
+        response = self.client.get(reverse("admin_tenant_detail", args=[self.profile.id]))
+
+        self.assertContains(response, "Confirmed contract events")
+        self.assertContains(response, "Move-in Payment")
+        self.assertContains(response, "REF-CONTRACT-EVENT")
+        self.assertContains(response, "Face-to-Face Cash")
+
+    def test_unambiguous_legacy_metadata_is_display_only_and_marked_legacy_derived(self):
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            payment_type="move_in",
+            payment_method="CASH",
+            amount=Decimal("30000.00"),
+            reference_code="REF-LEGACY-EVENT",
+            status="APPROVED",
+            metadata={"lease_id": str(self.lease.id)},
+        )
+
+        response = self.client.get(reverse("admin_tenant_detail", args=[self.profile.id]))
+
+        self.assertContains(response, "REF-LEGACY-EVENT")
+        self.assertContains(response, "legacy-derived")
+        self.assertFalse(LeaseContractEvent.objects.filter(source_payment=payment).exists())
+
+
+class AccountProfileTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="profile-admin@gmail.com",
+            username="profileadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.tenant = User.objects.create_user(
+            email="profile-tenant@gmail.com",
+            username="profiletenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.profile = TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Ada",
+            last_name="Lovelace",
+            contact_no="09170000000",
+            password_change_required=False,
+            created_by=self.admin,
+        )
+        self.unit = Unit.objects.create(number="P-101", monthly_rent=Decimal("12000.00"))
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("12000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            end_date=date(2027, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.attachment = TenantAttachment.objects.create(
+            tenant=self.tenant,
+            attachment_type="VALID_ID",
+            file="tenant_attachments/valid-id.pdf",
+            description="Government ID",
+            uploaded_by=self.admin,
+        )
+
+    def test_tenant_profile_page_shows_basic_info_lease_and_files(self):
+        self.client.force_login(self.tenant)
+
+        response = self.client.get(reverse("account_profile"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Ada Lovelace")
+        self.assertContains(response, "09170000000")
+        self.assertContains(response, "#P-101")
+        self.assertContains(response, "Jun 01, 2027")
+        self.assertContains(response, "Valid ID")
+        self.assertTemplateUsed(response, "accounts/profile_tenant.html")
+
+    def test_password_change_updates_current_user_password(self):
+        self.client.force_login(self.tenant)
+
+        response = self.client.post(
+            reverse("account_profile"),
+            {
+                "old_password": "password123",
+                "new_password1": "NewPassword123!",
+                "new_password2": "NewPassword123!",
+            },
+            follow=True,
+        )
+
+        self.tenant.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.tenant.check_password("NewPassword123!"))
+
+    def test_attachment_view_rejects_other_tenant(self):
+        other_tenant = User.objects.create_user(
+            email="other-profile-tenant@gmail.com",
+            username="otherprofiletenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=other_tenant,
+            first_name="Other",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=self.admin,
+        )
+
+        self.client.force_login(other_tenant)
+        blocked = self.client.get(reverse("account_profile_attachment", args=[self.attachment.id]))
+        self.assertEqual(blocked.status_code, 404)
+
+    def test_admin_attachment_view_missing_file_returns_404(self):
+        self.client.force_login(self.admin)
+        missing_attachment = TenantAttachment.objects.create(
+            tenant=self.tenant,
+            attachment_type="VALID_ID",
+            file="tenant_attachments/missing-file.png",
+            description="Missing file",
+            uploaded_by=self.admin,
+        )
+
+        response = self.client.get(reverse("admin_view_attachment", args=[missing_attachment.id]))
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_tenant_profile_form_rejects_unsupported_heic_attachment(self):
+        form = TenantProfileForm(
+            data={
+                "email": "heic-tenant@gmail.com",
+                "first_name": "Heic",
+                "last_name": "Tenant",
+                "contact_no": "09170000001",
+            },
+            files={
+                "valid_id_file": SimpleUploadedFile("iphone-id.HEIC", b"sample", content_type="image/heic"),
+            },
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("valid_id_file", form.errors)
+        self.assertIn("Invalid file type", str(form.errors["valid_id_file"]))
+
+    def test_tenant_profile_form_accepts_valid_docx_attachment(self):
+        docx = BytesIO()
+        with ZipFile(docx, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types/>")
+            archive.writestr("word/document.xml", "<document/>")
+        form = TenantProfileForm(
+            data={
+                "email": "docx-tenant@gmail.com",
+                "first_name": "Docx",
+                "last_name": "Tenant",
+                "contact_no": "09170000002",
+            },
+            files={
+                "valid_id_file": SimpleUploadedFile(
+                    "id.docx",
+                    docx.getvalue(),
+                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ),
+            },
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+
+
+class TenantAttachmentUploadValidationTests(TestCase):
+    @staticmethod
+    def _upload_for(extension):
+        content_types = {
+            ".pdf": "application/pdf",
+            ".doc": "application/msword",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+        }
+        if extension == ".pdf":
+            content = b"%PDF-1.7\nlocal test document"
+        elif extension == ".doc":
+            content = bytes.fromhex("D0CF11E0A1B11AE1") + b"local test document"
+        elif extension == ".docx":
+            archive = BytesIO()
+            with ZipFile(archive, "w") as docx:
+                docx.writestr("[Content_Types].xml", "<Types/>")
+                docx.writestr("word/document.xml", "<document/>")
+            content = archive.getvalue()
+        else:
+            image_file = BytesIO()
+            image_format = "PNG" if extension == ".png" else "JPEG"
+            Image.new("RGB", (2, 2), color="navy").save(image_file, format=image_format)
+            content = image_file.getvalue()
+        return SimpleUploadedFile(f"sample{extension}", content, content_type=content_types[extension])
+
+    def _form(self, file):
+        return TenantProfileForm(
+            data={
+                "email": "upload.validation@example.test",
+                "first_name": "Upload",
+                "last_name": "Validation",
+                "contact_no": "09170000000",
+            },
+            files={"valid_id_file": file},
+        )
+
+    def test_all_documented_formats_are_accepted_by_server_validation(self):
+        for extension in (".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg"):
+            with self.subTest(extension=extension):
+                form = self._form(self._upload_for(extension))
+                self.assertTrue(form.is_valid(), form.errors)
+
+    def test_executable_text_archive_and_unsupported_images_are_rejected(self):
+        invalid_uploads = (
+            SimpleUploadedFile("malware.exe", b"MZ fake executable", content_type="application/octet-stream"),
+            SimpleUploadedFile("notes.txt", b"plain text", content_type="text/plain"),
+            SimpleUploadedFile("archive.zip", b"PK\x03\x04not a Word document", content_type="application/zip"),
+            SimpleUploadedFile("image.gif", b"GIF89a", content_type="image/gif"),
+        )
+        for uploaded_file in invalid_uploads:
+            with self.subTest(filename=uploaded_file.name):
+                form = self._form(uploaded_file)
+                self.assertFalse(form.is_valid())
+                self.assertIn("valid_id_file", form.errors)
+                self.assertIn("Invalid file type. Please upload", str(form.errors["valid_id_file"]))
+
+    def test_upload_over_10mb_is_rejected_by_server_validation(self):
+        oversized_pdf = SimpleUploadedFile(
+            "large.pdf",
+            b"%PDF-1.7" + b"0" * TenantAttachment.MAX_UPLOAD_SIZE,
+            content_type="application/pdf",
+        )
+        form = self._form(oversized_pdf)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("valid_id_file", form.errors)
+        self.assertIn("less than 10MB", str(form.errors["valid_id_file"]))
+
+    def test_tenant_edit_form_uses_the_same_upload_validation(self):
+        tenant = User.objects.create_user(
+            email="edit-upload@example.test",
+            username="editupload",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        profile = TenantProfile.objects.create(
+            user=tenant,
+            first_name="Edit",
+            last_name="Upload",
+        )
+        form = ComprehensiveTenantEditForm(
+            profile,
+            data={
+                "email": tenant.email,
+                "username": tenant.username,
+                "role": tenant.role,
+                "is_active": "on",
+                "first_name": profile.first_name,
+                "last_name": profile.last_name,
+                "contact_no": "",
+                "new_password": "",
+                "confirm_password": "",
+            },
+            files={
+                "contract_file": SimpleUploadedFile(
+                    "contract.txt", b"plain text", content_type="text/plain"
+                ),
+            },
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("contract_file", form.errors)
+        self.assertIn("Invalid file type. Please upload", str(form.errors["contract_file"]))
+
+    def test_tenant_edit_page_renders_the_shared_upload_feedback_controls(self):
+        admin = User.objects.create_superuser(
+            email="upload-ui-admin@example.test",
+            username="uploaduiadmin",
+            password="password123",
+        )
+        tenant = User.objects.create_user(
+            email="upload-ui-tenant@example.test",
+            username="uploaduitenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        profile = TenantProfile.objects.create(
+            user=tenant,
+            first_name="Upload",
+            last_name="Tenant",
+        )
+        self.client.force_login(admin)
+
+        response = self.client.get(reverse("admin_edit_tenant", args=[profile.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "tenant-upload-validation.js")
+        self.assertContains(response, 'data-tenant-document-upload')
+        self.assertContains(response, 'aria-describedby="contract_file_help contract_file_error"')
+
+
+class StaffRoleFoundationTests(TestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="staff@gmail.com",
+            username="staffuser",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="staff-tenant@gmail.com",
+            username="stafftenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.admin = User.objects.create_superuser(
+            email="staff-admin@gmail.com",
+            username="staffadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.tenant_profile = TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Test",
+            last_name="Tenant",
+            contact_no="09170000003",
+            password_change_required=False,
+            created_by=self.admin,
+        )
+
+    def test_staff_login_redirects_to_admin_dashboard(self):
+        response = self.client.post(
+            reverse("login"),
+            {"username": self.staff.email, "password": "password123"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, reverse("admin_dashboard"))
+
+    def test_comprehensive_tenant_edit_form_accepts_staff_role(self):
+        form = ComprehensiveTenantEditForm(
+            self.tenant_profile,
+            data={
+                "email": self.tenant.email,
+                "username": self.tenant.username,
+                "role": User.Role.STAFF,
+                "is_active": True,
+                "new_password": "",
+                "confirm_password": "",
+                "first_name": self.tenant_profile.first_name,
+                "last_name": self.tenant_profile.last_name,
+                "contact_no": self.tenant_profile.contact_no,
+            },
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.fields["role"].help_text, "Assign user role (Tenant, Staff, or Admin)")
+
+
+class StaffPortalRestrictionTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="staff-portal-admin@gmail.com",
+            username="staffportaladmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="staff-portal@gmail.com",
+            username="staffportal",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="staff-portal-tenant@gmail.com",
+            username="staffportaltenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Portal",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=self.admin,
+        )
+        self.unit = Unit.objects.create(number="SP-101", monthly_rent=Decimal("10000.00"), status="AVAILABLE")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-STAFF-PORTAL",
+            bill_ids="",
+            payment_type="full",
+            payment_method="CASH",
+            amount=Decimal("10000.00"),
+            status="PENDING",
+            preferred_date=date(2026, 7, 5),
+        )
+        self.announcement = Announcement.objects.create(
+            title="Water Interruption Notice",
+            body="Scheduled maintenance will affect water access from 1 PM to 3 PM.",
+            is_active=True,
+            created_by=self.admin,
+        )
+
+    def test_staff_can_access_allowed_operational_pages(self):
+        self.client.force_login(self.staff)
+
+        for url_name in [
+            "admin_dashboard",
+            "admin_maintenance",
+            "admin_notifications",
+            "admin_announcements",
+        ]:
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(url_name))
+                self.assertEqual(response.status_code, 200)
+
+    def test_staff_dashboard_hides_admin_only_sidebar_items(self):
+        self.client.force_login(self.staff)
+
+        response = self.client.get(reverse("admin_dashboard"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Staff Overview")
+        self.assertContains(response, "Notifications")
+        self.assertContains(response, "Repair Requests")
+        self.assertContains(response, reverse("admin_announcements"))
+        self.assertNotContains(response, "Operations")
+        self.assertNotContains(response, reverse("admin_payments"))
+        self.assertNotContains(response, reverse("admin_water"))
+        self.assertNotContains(response, reverse("admin_units"))
+        self.assertNotContains(response, reverse("admin_tenants"))
+        self.assertNotContains(response, reverse("admin_forecasting"))
+        self.assertNotContains(response, reverse("admin_tenant_risk"))
+        self.assertNotContains(response, reverse("admin_business_profile"))
+
+    def test_staff_is_redirected_from_admin_only_routes(self):
+        self.client.force_login(self.staff)
+
+        blocked_urls = [
+            reverse("admin_tenants"),
+            reverse("admin_units"),
+            reverse("admin_forecasting"),
+            reverse("admin_tenant_risk"),
+            reverse("admin_business_profile"),
+            reverse("admin_create_announcement"),
+            reverse("admin_edit_announcement", args=[self.announcement.id]),
+            reverse("admin_delete_announcement", args=[self.announcement.id]),
+            reverse("admin_payments"),
+            reverse("admin_payment_calendar"),
+            reverse("admin_payment_detail", args=[self.payment.id]),
+            reverse("admin_homepage_banners"),
+            reverse("admin_edit_landing_banner"),
+            reverse("admin_edit_landing_hero"),
+            reverse("admin_edit_landing_about"),
+            reverse("admin_edit_landing_services"),
+            reverse("admin_edit_landing_contact"),
+            reverse("admin_edit_landing_footer"),
+            reverse("admin_landing_sections"),
+            reverse("admin_landing_features"),
+            reverse("admin_delete_payment", args=[self.payment.id]),
+            reverse("admin_water"),
+            reverse("admin_water_export_csv"),
+            reverse("admin_water_rate"),
+        ]
+
+        for blocked_url in blocked_urls:
+            with self.subTest(blocked_url=blocked_url):
+                response = self.client.get(blocked_url)
+                self.assertEqual(response.status_code, 302)
+                self.assertIn(reverse("login"), response.url)
+
+    def test_staff_cannot_access_payment_detail_actions(self):
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            reverse("admin_payment_detail", args=[self.payment.id]),
+            {
+                "action": "update_payment_type",
+                "payment_type": "rent_only",
+            },
+        )
+
+        self.payment.refresh_from_db()
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response.url)
+        self.assertEqual(self.payment.payment_type, "full")
+
+    def test_staff_can_view_announcements_read_only(self):
+        self.client.force_login(self.staff)
+
+        response = self.client.get(reverse("admin_announcements"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.announcement.title)
+        self.assertNotContains(response, reverse("admin_create_announcement"))
+        self.assertNotContains(response, reverse("admin_edit_announcement", args=[self.announcement.id]))
+        self.assertNotContains(response, reverse("admin_delete_announcement", args=[self.announcement.id]))
+        self.assertNotContains(response, "Business Profile Live")
+        self.assertNotContains(response, "Landing Banner Live")
+        self.assertNotContains(response, reverse("admin_business_profile"))
+
+    def test_admin_still_has_access_to_admin_only_pages(self):
+        self.client.force_login(self.admin)
+
+        direct_ok = ["admin_tenants", "admin_units", "admin_forecasting", "admin_announcements", "admin_business_profile", "admin_edit_landing_banner", "admin_edit_landing_hero", "admin_edit_landing_about", "admin_edit_landing_services", "admin_edit_landing_contact", "admin_edit_landing_footer"]
+        redirects = ["admin_homepage_banners", "admin_landing_sections", "admin_landing_features"]
+
+        for url_name in direct_ok:
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(url_name))
+                self.assertEqual(response.status_code, 200)
+
+        for url_name in redirects:
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(url_name))
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(response.url, reverse("admin_business_profile"))
+
+
+class PublicLandingCmsTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="cms-admin@gmail.com",
+            username="cmsadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="cms-staff@gmail.com",
+            username="cmsstaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+
+    def test_admin_can_access_preview_editor_and_section_forms(self):
+        self.client.force_login(self.admin)
+        for url_name in ["admin_business_profile", "admin_edit_landing_banner", "admin_edit_landing_hero", "admin_edit_landing_about", "admin_edit_landing_services", "admin_edit_landing_contact", "admin_edit_landing_footer"]:
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(url_name))
+                self.assertEqual(response.status_code, 200)
+
+    def test_staff_is_blocked_from_preview_editor_and_section_forms(self):
+        self.client.force_login(self.staff)
+        for url_name in ["admin_business_profile", "admin_edit_landing_banner", "admin_edit_landing_hero", "admin_edit_landing_about", "admin_edit_landing_services", "admin_edit_landing_contact", "admin_edit_landing_footer", "admin_landing_sections", "admin_landing_features"]:
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(url_name))
+                self.assertEqual(response.status_code, 302)
+                self.assertIn(reverse("login"), response.url)
+
+    def test_login_page_renders_with_no_cms_records(self):
+        BusinessProfile.objects.all().delete()
+        HomepageBanner.objects.all().delete()
+        LandingPageSection.objects.all().delete()
+        LandingPageFeature.objects.all().delete()
+
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "RealEstate360+")
+        self.assertContains(response, "RealEstate360+")
+        self.assertContains(response, "Designed")
+
+    def test_legacy_cms_routes_redirect_to_preview_editor(self):
+        self.client.force_login(self.admin)
+        for url_name in ["admin_homepage_banners", "admin_landing_sections", "admin_landing_features"]:
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(url_name))
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(response.url, reverse("admin_business_profile"))
+
+    def test_about_editor_updates_both_public_about_content_cards(self):
+        profile = BusinessProfile.objects.create(
+            business_name="CMS Property",
+            about_text="Previous secondary content",
+            contact_email="cms@example.com",
+            contact_phone="09170000000",
+            address="Mandaluyong City",
+            inquiry_text="Contact us.",
+            is_active=True,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_edit_landing_about"),
+            {
+                "about_title": "Our community",
+                "about_description": "Primary about content",
+                "about_text": "Secondary about content",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        profile.refresh_from_db()
+        self.assertEqual(profile.about_description, "Primary about content")
+        self.assertEqual(profile.about_text, "Secondary about content")
+
+        response = self.client.get("/")
+        self.assertContains(response, "Primary about content")
+        self.assertContains(response, "Secondary about content")
+
+    def test_hero_editor_does_not_expose_a_custom_button_url(self):
+        BusinessProfile.objects.create(
+            business_name="CMS Property",
+            about_text="About content",
+            contact_email="cms@example.com",
+            contact_phone="09170000000",
+            address="Mandaluyong City",
+            inquiry_text="Contact us.",
+            hero_button_url="https://example.invalid/obsolete-hero-link",
+            is_active=True,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_edit_landing_hero"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, 'name="hero_button_url"')
+
+        response = self.client.get("/")
+        self.assertContains(response, 'href="#about" class="lp-btn-primary"')
+        self.assertNotContains(response, "https://example.invalid/obsolete-hero-link")
+
+    def test_hero_keeps_existing_property_images_when_a_profile_exists(self):
+        BusinessProfile.objects.create(
+            business_name="CMS Property",
+            about_text="About content",
+            contact_email="cms@example.com",
+            contact_phone="09170000000",
+            address="Mandaluyong City",
+            inquiry_text="Contact us.",
+            is_active=True,
+        )
+
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "img/accounts/img 1.jpg")
+        self.assertContains(response, "img/accounts/img 8.jpg")
+
+    def test_blank_services_are_hidden_and_configured_services_render(self):
+        profile = BusinessProfile.objects.create(
+            business_name="CMS Property",
+            about_text="About content",
+            contact_email="cms@example.com",
+            contact_phone="09170000000",
+            address="Mandaluyong City",
+            inquiry_text="Contact us.",
+            service_1_title="On-site support",
+            service_1_description="Help is available when tenants need it.",
+            is_active=True,
+        )
+
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context["landing_service_cards"]), 1)
+        self.assertContains(response, "On-site support")
+        self.assertContains(response, "Help is available when tenants need it.")
+        self.assertNotContains(response, "Clean Shared Spaces")
+
+        profile.service_1_title = ""
+        profile.service_1_description = ""
+        profile.save(update_fields=["service_1_title", "service_1_description"])
+        response = self.client.get("/")
+        self.assertEqual(response.context["landing_service_cards"], [])
+        self.assertNotContains(response, "Property Highlights")
+
+    def test_services_editor_groups_each_service_in_its_own_box(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_edit_landing_services"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Service 1")
+        self.assertContains(response, "Service 2")
+        self.assertContains(response, "Service 3")
+
+
+
+class AdminPaymentTypeEditTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="admin@gmail.com",
+            username="admin",
+            password="password123",
+        )
+        self.tenant = User.objects.create_user(
+            email="tenant@gmail.com",
+            username="tenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Tenant",
+            last_name="Person",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(number="T-101")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            is_active=True,
+        )
+        self.bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 9, 1),
+            due_date=date(2026, 9, 5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10350.00"),
+            status="PAID",
+        )
+        self.payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-TEST",
+            bill_ids=str(self.bill.id),
+            payment_type="full",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="APPROVED",
+        )
+
+    def test_admin_can_change_payment_type_from_full_to_rent_only(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/payments/{self.payment.id}/detail/",
+            {
+                "action": "update_payment_type",
+                "payment_type": "rent_only",
+            },
+            follow=True,
+        )
+
+        self.payment.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.payment.payment_type, "rent_only")
+        self.assertEqual(self.payment.metadata.get("payment_type"), "rent_only")
+
+    def test_admin_payments_context_uses_tenant_full_name_and_affected_month(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/payments/")
+
+        self.assertEqual(response.status_code, 200)
+        page_payment = response.context["page_obj"][0]
+        self.assertEqual(page_payment.tenant_display_name, "Tenant Person")
+        self.assertEqual(page_payment.affected_months, "Sep 2026")
+
+    def test_admin_payments_labels_maintenance_only_rows_as_maintenance(self):
+        maintenance_line = BillLineItem.objects.create(
+            monthly_bill=self.bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("900.00"),
+            paid_amount=Decimal("900.00"),
+            status=BillLineItem.STATUS_PAID,
+        )
+        self.bill.total_due = Decimal("11250.00")
+        self.bill.payment_reference = self.payment.reference_code
+        self.bill.save(update_fields=["total_due", "payment_reference"])
+        self.payment.payment_type = "maintenance_only"
+        self.payment.amount = Decimal("900.00")
+        self.payment.save(update_fields=["payment_type", "amount"])
+
+        self.client.force_login(self.admin)
+        response = self.client.get("/admin-portal/payments/")
+
+        self.assertEqual(response.status_code, 200)
+        page_payment = response.context["page_obj"][0]
+        self.assertEqual(page_payment.bill_components, "Maintenance")
+        self.assertEqual(page_payment.affected_months, "Sep 2026")
+
+    def test_admin_payments_all_view_includes_pending_f2f_cash_records(self):
+        ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-PENDING-1",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 5),
+        )
+        ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-PENDING-2",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 8),
+            schedule_confirmed=True,
+        )
+        self.client.force_login(self.admin)
+
+        all_response = self.client.get("/admin-portal/payments/")
+        f2f_response = self.client.get("/admin-portal/payments/?status=PENDING&method=CASH")
+
+        self.assertEqual(all_response.status_code, 200)
+        self.assertEqual(f2f_response.status_code, 200)
+        self.assertEqual(all_response.context["page_obj"].paginator.count, 3)
+        self.assertEqual(len(all_response.context["other_payments"]), 3)
+        self.assertFalse(all_response.context["is_f2f_schedule_view"])
+        self.assertEqual(f2f_response.context["page_obj"].paginator.count, 2)
+        self.assertEqual(len(f2f_response.context["cash_schedule_payments"]), 2)
+        self.assertTrue(f2f_response.context["is_f2f_schedule_view"])
+        self.assertNotContains(f2f_response, "Manage in View")
+        self.assertNotContains(f2f_response, "Mark Paid")
+        self.assertNotContains(f2f_response, "Confirm</span>")
+
+    def test_admin_payments_excludes_admin_owned_payment_records(self):
+        admin_owned_payment = ManualPayment.objects.create(
+            user=self.admin,
+            reference_code="REF-ADMIN-BAD",
+            bill_ids="",
+            payment_type="move_in",
+            payment_method="PAYMONGO",
+            amount=Decimal("30725.00"),
+            status="APPROVED",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/payments/")
+
+        self.assertEqual(response.status_code, 200)
+        payment_ids = [payment.id for payment in response.context["page_obj"].object_list]
+        self.assertNotIn(admin_owned_payment.id, payment_ids)
+
+    def test_admin_payment_calendar_groups_cash_schedules_by_week_day(self):
+        first_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-CAL-1",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 16),
+            preferred_time=time(13, 0),
+        )
+        second_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-CAL-2",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("5000.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 18),
+            preferred_time=time(15, 30),
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(
+            reverse("admin_payment_calendar"),
+            {"week": "2026-06-15", "day": "2026-06-16"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["week_start"], date(2026, 6, 15))
+        self.assertEqual(response.context["week_end"], date(2026, 6, 21))
+        self.assertEqual(response.context["week_total_count"], 2)
+        self.assertEqual(response.context["selected_payments"], [first_payment])
+        self.assertContains(response, "Tenant Person")
+        self.assertContains(response, "1:00 PM")
+        self.assertContains(response, "3:30 PM")
+        self.assertContains(response, "REF-F2F-CAL-1")
+        self.assertNotIn(second_payment, response.context["selected_payments"])
+
+    def test_admin_payment_calendar_excludes_admin_owned_cash_records(self):
+        tenant_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-TENANT-CAL",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 16),
+            preferred_time=time(13, 0),
+        )
+        admin_owned_payment = ManualPayment.objects.create(
+            user=self.admin,
+            reference_code="REF-F2F-ADMIN-CAL",
+            bill_ids="",
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 16),
+            preferred_time=time(14, 0),
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(
+            reverse("admin_payment_calendar"),
+            {"week": "2026-06-15", "day": "2026-06-16"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["selected_payments"], [tenant_payment])
+        self.assertContains(response, "REF-F2F-TENANT-CAL")
+        self.assertNotContains(response, "REF-F2F-ADMIN-CAL")
+        self.assertNotIn(admin_owned_payment, response.context["selected_payments"])
+
+    def test_pending_cash_payment_detail_keeps_requested_amount_when_bill_now_paid(self):
+        self.bill.status = "PAID"
+        self.bill.rent_paid = self.bill.base_rent
+        self.bill.parking_paid = self.bill.parking_fee
+        self.bill.save(update_fields=["status", "rent_paid", "parking_paid"])
+        pending_cash_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-PENDING",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(f"/admin-portal/payments/{pending_cash_payment.id}/detail/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["bills"][0]["rent"], Decimal("10000.00"))
+        self.assertEqual(response.context["bills"][0]["parking"], Decimal("350.00"))
+        self.assertEqual(response.context["bills"][0]["total"], Decimal("10350.00"))
+        self.assertContains(response, "₱10,350.00")
+
+    def test_pending_cash_payment_detail_has_reschedule_action(self):
+        pending_cash_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-RESCHEDULE-ACTION",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 16),
+            preferred_time=time(13, 0),
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_payment_detail", args=[pending_cash_payment.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Reschedule")
+        self.assertContains(response, reverse("admin_reschedule_cash_payment", args=[pending_cash_payment.id]))
+
+    @patch("accounts.admin_payment_views.send_email_via_resend", return_value=True)
+    def test_admin_can_reschedule_pending_cash_payment_and_notify_tenant(self, mock_send_email):
+        pending_cash_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-RESCHEDULE",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 16),
+            preferred_time=time(13, 0),
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_reschedule_cash_payment", args=[pending_cash_payment.id]),
+            {
+                "preferred_date": "2026-06-17",
+                "preferred_time": "14:30",
+                "schedule_admin_note": "Please visit after lunch.",
+            },
+            follow=True,
+        )
+
+        pending_cash_payment.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(pending_cash_payment.preferred_date, date(2026, 6, 17))
+        self.assertEqual(pending_cash_payment.preferred_time, time(14, 30))
+        self.assertEqual(pending_cash_payment.schedule_admin_note, "Please visit after lunch.")
+        self.assertTrue(pending_cash_payment.schedule_confirmed)
+        self.assertEqual(pending_cash_payment.status, "PENDING")
+        self.assertTrue(
+            Notification.objects.filter(
+                user=self.tenant,
+                title="Cash payment appointment updated",
+                message__icontains="Please visit after lunch.",
+            ).exists()
+        )
+        mock_send_email.assert_called_once()
+        self.assertContains(response, "Cash appointment rescheduled")
+
+    def test_admin_reschedule_rejects_weekend_cash_schedule(self):
+        pending_cash_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-WEEKEND",
+            bill_ids=str(self.bill.id),
+            payment_type="rent_only",
+            payment_method="CASH",
+            amount=Decimal("10350.00"),
+            status="PENDING",
+            preferred_date=date(2026, 6, 16),
+            preferred_time=time(13, 0),
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_reschedule_cash_payment", args=[pending_cash_payment.id]),
+            {
+                "preferred_date": "2026-06-20",
+                "preferred_time": "14:30",
+                "schedule_admin_note": "Weekend attempt.",
+            },
+        )
+
+        pending_cash_payment.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "weekday schedule")
+        self.assertEqual(pending_cash_payment.preferred_date, date(2026, 6, 16))
+        self.assertEqual(pending_cash_payment.preferred_time, time(13, 0))
+        self.assertEqual(pending_cash_payment.schedule_admin_note, "")
+
+
+class AdminWaterSaveBehaviorTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="water-admin@gmail.com",
+            username="wateradmin",
+            password="password123",
+        )
+        self.tenant = User.objects.create_user(
+            email="water-tenant@gmail.com",
+            username="watertenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Water",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(number="W-101", status="OCCUPIED")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        WaterRate.objects.create(
+            effective_date=date(2026, 6, 1),
+            rate_per_cu_m=Decimal("45.00"),
+        )
+        self.reading = WaterReading.objects.create(
+            lease=self.lease,
+            reading_month=date(2026, 6, 1),
+            previous_reading=Decimal("0.00"),
+            current_reading=Decimal("10.00"),
+            consumption=Decimal("10.00"),
+            rate_used=Decimal("45.00"),
+            computed_amount=Decimal("450.00"),
+        )
+        self.bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 6, 1),
+            base_rent=Decimal("10000.00"),
+            rent_paid=Decimal("10000.00"),
+            water_amount=Decimal("450.00"),
+            water_paid=Decimal("0.00"),
+            total_due=Decimal("10450.00"),
+            status="PARTIALLY_PAID",
+            source_water_reading=self.reading,
+        )
+
+    def test_water_save_ignores_completed_readings(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            "/admin-portal/water/process/",
+            {
+                "month": "6",
+                "year": "2026",
+                "lease_ids": [str(self.lease.id)],
+                f"reading_{self.lease.id}": "10.00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(WaterReading.objects.filter(lease=self.lease, reading_month=date(2026, 6, 1)).count(), 1)
+        self.bill.refresh_from_db()
+        self.assertEqual(self.bill.water_amount, Decimal("450.00"))
+        self.assertEqual(self.bill.status, "PARTIALLY_PAID")
+
+    def test_water_filter_keeps_shared_pump_percentage_denominator_global(self):
+        other_tenant = User.objects.create_user(
+            email="water-other@gmail.com",
+            username="waterother",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=other_tenant,
+            first_name="Other",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        other_unit = Unit.objects.create(number="W-102", status="OCCUPIED")
+        other_lease = Lease.objects.create(
+            tenant=other_tenant,
+            unit=other_unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        WaterReading.objects.create(
+            lease=other_lease,
+            reading_month=date(2026, 6, 1),
+            previous_reading=Decimal("0.00"),
+            current_reading=Decimal("30.00"),
+            consumption=Decimal("30.00"),
+            rate_used=Decimal("45.00"),
+            computed_amount=Decimal("1350.00"),
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/water/?month=6&year=2026&search=W-101")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "25.00%")
+        self.assertNotContains(response, "100.00%")
+
+    def test_water_page_uses_tenant_profile_full_name(self):
+        self.tenant.username = "WTenantShort"
+        self.tenant.save(update_fields=["username"])
+        profile = self.tenant.tenantprofile
+        profile.first_name = "Display"
+        profile.last_name = "Person"
+        profile.save(update_fields=["first_name", "last_name"])
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/water/?month=6&year=2026&search=Display")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Display Person")
+        self.assertNotContains(response, "WTenantShort")
+
+    def test_water_page_includes_status_active_lease_when_is_active_flag_is_stale(self):
+        Lease.objects.filter(pk=self.lease.pk).update(is_active=False)
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/water/?month=6&year=2026")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Water Tenant")
+        self.assertContains(response, "#W-101")
+
+    def test_water_page_starts_occupied_mid_month_lease_on_next_water_month(self):
+        tenant = User.objects.create_user(
+            email="sophia.sinco.water@gmail.com",
+            username="sophiasincowater",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=tenant,
+            first_name="Sophia",
+            last_name="Sinco",
+            password_change_required=False,
+            created_by=None,
+        )
+        unit = Unit.objects.create(number="W-605", status="OCCUPIED")
+        lease = Lease.objects.create(
+            tenant=tenant,
+            unit=unit,
+            monthly_rent=Decimal("14060.00"),
+            due_day=16,
+            start_date=date(2026, 6, 16),
+            end_date=date(2027, 6, 16),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        Lease.objects.filter(pk=lease.pk).update(status=Lease.STATUS_PENDING_PAYMENT, is_active=False)
+        self.client.force_login(self.admin)
+
+        move_in_month_response = self.client.get("/admin-portal/water/?month=6&year=2026&search=Sinco")
+        next_month_response = self.client.get("/admin-portal/water/?month=7&year=2026&search=Sinco")
+
+        self.assertEqual(move_in_month_response.status_code, 200)
+        self.assertNotContains(move_in_month_response, "Sophia Sinco")
+        self.assertNotContains(move_in_month_response, "#W-605")
+        self.assertEqual(next_month_response.status_code, 200)
+        self.assertContains(next_month_response, "Sophia Sinco")
+        self.assertContains(next_month_response, "#W-605")
+
+    def test_water_page_includes_advance_paid_contract_month_even_with_stale_lifecycle(self):
+        tenant = User.objects.create_user(
+            email="advance.sinco.water@gmail.com",
+            username="advancesincowater",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=tenant,
+            first_name="Sophia",
+            last_name="Sinco",
+            password_change_required=False,
+            created_by=None,
+        )
+        unit = Unit.objects.create(number="W-606", status="AVAILABLE")
+        lease = Lease.objects.create(
+            tenant=tenant,
+            unit=unit,
+            monthly_rent=Decimal("14060.00"),
+            due_day=16,
+            start_date=date(2026, 6, 16),
+            end_date=date(2027, 6, 16),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        Lease.objects.filter(pk=lease.pk).update(status=Lease.STATUS_PENDING_PAYMENT, is_active=False)
+        MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=date(2026, 7, 1),
+            due_date=date(2026, 7, 16),
+            base_rent=Decimal("14060.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("14060.00"),
+            status="PAID",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/water/?month=7&year=2026&search=Sinco")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Sophia Sinco")
+        self.assertContains(response, "#W-606")
+
+
+class AdminBillingSettlementWarningTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="billing-admin@gmail.com",
+            username="billingadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.tenant = User.objects.create_user(
+            email="billing-tenant@gmail.com",
+            username="billingtenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Billing",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(number="B-101", status="OCCUPIED")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            is_active=True,
+        )
+        self.old_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 5, 1),
+            due_date=date(2026, 5, 5),
+            base_rent=Decimal("9000.00"),
+            water_amount=Decimal("500.00"),
+            parking_fee=Decimal("300.00"),
+            interest=Decimal("200.00"),
+            total_due=Decimal("10000.00"),
+            status="UNPAID",
+        )
+        self.current_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 6, 1),
+            due_date=date(2026, 6, 5),
+            base_rent=Decimal("10125.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10475.00"),
+            status="UNPAID",
+        )
+
+    def test_settle_current_bill_warns_when_prior_unpaid_balance_exists(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(reverse("admin_mark_bill_paid", args=[self.current_bill.id]))
+
+        self.current_bill.refresh_from_db()
+        self.old_bill.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Older unpaid bills were found")
+        self.assertContains(response, "May 2026")
+        self.assertContains(response, "Unpaid Months to Present")
+        self.assertContains(response, "Settle All")
+        self.assertNotContains(response, "Settle Selected Only")
+        self.assertEqual(self.current_bill.status, "UNPAID")
+        self.assertEqual(self.old_bill.status, "UNPAID")
+
+    def test_settle_warning_refreshes_stale_prior_late_fee_before_display(self):
+        self.old_bill.interest = Decimal("0.00")
+        self.old_bill.total_due = Decimal("9800.00")
+        self.old_bill.save(update_fields=["interest", "total_due"])
+        self.client.force_login(self.admin)
+
+        response = self.client.post(reverse("admin_mark_bill_paid", args=[self.current_bill.id]))
+
+        self.old_bill.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "300.00")
+        self.assertContains(response, "10,300.00")
+        self.assertEqual(self.old_bill.interest, Decimal("300.00"))
+        self.assertEqual(self.old_bill.total_due, Decimal("10300.00"))
+        self.assertEqual(self.old_bill.status, "UNPAID")
+
+    def test_settle_selected_action_is_not_allowed_when_prior_balance_exists(self):
+        self.client.force_login(self.admin)
+
+        with patch("accounts.admin_billing_views.create_and_send_invoice_for_paid_bill"):
+            response = self.client.post(
+                reverse("admin_mark_bill_paid", args=[self.current_bill.id]),
+                {"action": "settle_selected"},
+            )
+
+        self.current_bill.refresh_from_db()
+        self.old_bill.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Older unpaid bills were found")
+        self.assertEqual(self.current_bill.status, "UNPAID")
+        self.assertEqual(self.old_bill.status, "UNPAID")
+
+    def test_settle_all_pays_prior_balances_and_selected_bill(self):
+        self.client.force_login(self.admin)
+
+        with patch("accounts.admin_billing_views.create_and_send_invoice_for_paid_bill"):
+            response = self.client.post(
+                reverse("admin_mark_bill_paid", args=[self.current_bill.id]),
+                {"action": "settle_all"},
+            )
+
+        self.current_bill.refresh_from_db()
+        self.old_bill.refresh_from_db()
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.current_bill.status, "PAID")
+        self.assertEqual(self.old_bill.status, "PAID")
+
+    def test_admin_repair_late_fees_preview_and_apply(self):
+        self.old_bill.interest = Decimal("106944.75")
+        self.old_bill.total_due = Decimal("116744.75")
+        self.old_bill.save(update_fields=["interest", "total_due"])
+        self.client.force_login(self.admin)
+
+        preview_response = self.client.get(reverse("admin_repair_late_fees"))
+
+        self.assertEqual(preview_response.status_code, 200)
+        self.assertContains(preview_response, "Review inflated late-fee summaries")
+        self.assertContains(preview_response, "106,944.75")
+        self.assertContains(preview_response, "279.00")
+        candidate = next(
+            row for row in preview_response.context["preview"]["eligible"]
+            if row["bill_id"] == self.old_bill.pk
+        )
+
+        apply_response = self.client.post(
+            reverse("admin_repair_late_fees"),
+            {
+                "bill_ids": [str(self.old_bill.pk)],
+                f"snapshot_{self.old_bill.pk}": candidate["snapshot_token"],
+                "confirm_apply": "yes",
+            },
+        )
+        self.old_bill.refresh_from_db()
+
+        self.assertEqual(apply_response.status_code, 200)
+        self.assertContains(apply_response, "Repaired 1 bill(s)")
+        self.assertEqual(self.old_bill.interest, Decimal("279.00"))
+        self.assertEqual(self.old_bill.total_due, Decimal("10079.00"))
+
+    def test_admin_repair_requires_explicit_confirmation_and_selected_bill(self):
+        self.client.force_login(self.admin)
+        self.old_bill.interest = Decimal("106944.75")
+        self.old_bill.total_due = Decimal("116744.75")
+        self.old_bill.save(update_fields=["interest", "total_due"])
+
+        response = self.client.post(
+            reverse("admin_repair_late_fees"),
+            {"bill_ids": [str(self.old_bill.pk)]},
+        )
+
+        self.old_bill.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Confirm the selected repairs")
+        self.assertEqual(self.old_bill.interest, Decimal("106944.75"))
+
+    def test_admin_repair_reports_bill_changed_after_preview(self):
+        self.client.force_login(self.admin)
+        self.old_bill.interest = Decimal("106944.75")
+        self.old_bill.total_due = Decimal("116744.75")
+        self.old_bill.save(update_fields=["interest", "total_due"])
+        preview = self.client.get(reverse("admin_repair_late_fees"))
+        candidate = next(
+            row for row in preview.context["preview"]["eligible"]
+            if row["bill_id"] == self.old_bill.pk
+        )
+        self.old_bill.base_rent += Decimal("100.00")
+        self.old_bill.total_due += Decimal("100.00")
+        self.old_bill.save(update_fields=["base_rent", "total_due"])
+
+        response = self.client.post(
+            reverse("admin_repair_late_fees"),
+            {
+                "bill_ids": [str(self.old_bill.pk)],
+                f"snapshot_{self.old_bill.pk}": candidate["snapshot_token"],
+                "confirm_apply": "yes",
+            },
+        )
+
+        self.old_bill.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "changed since preview")
+        self.assertEqual(self.old_bill.interest, Decimal("106944.75"))
+
+    def test_admin_cleanup_duplicate_bills_removes_unpaid_duplicate_shell(self):
+        paid_april = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 4, 1),
+            due_date=date(2026, 4, 10),
+            base_rent=Decimal("24585.00"),
+            water_amount=Decimal("2084.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("26669.00"),
+            status="PAID",
+            rent_paid=Decimal("24585.00"),
+            water_paid=Decimal("2084.00"),
+        )
+        duplicate_april = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 4, 10),
+            due_date=date(2026, 4, 10),
+            base_rent=Decimal("24585.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("737.55"),
+            total_due=Decimal("25322.55"),
+            status="UNPAID",
+        )
+        self.client.force_login(self.admin)
+
+        preview_response = self.client.get(reverse("admin_cleanup_duplicate_bills"))
+
+        self.assertEqual(preview_response.status_code, 200)
+        self.assertContains(preview_response, "Clean Duplicate Billing Records")
+        self.assertContains(preview_response, f"#{duplicate_april.id}")
+        self.assertContains(preview_response, f"#{paid_april.id}")
+
+        apply_response = self.client.post(reverse("admin_cleanup_duplicate_bills"))
+
+        self.assertEqual(apply_response.status_code, 302)
+        self.assertTrue(MonthlyBill.objects.filter(pk=paid_april.pk).exists())
+        self.assertFalse(MonthlyBill.objects.filter(pk=duplicate_april.pk).exists())
+
+    def test_settle_warning_excludes_paid_month_duplicate_unpaid_shell(self):
+        paid_april = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 4, 1),
+            due_date=date(2026, 4, 10),
+            base_rent=Decimal("24585.00"),
+            water_amount=Decimal("2084.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("26669.00"),
+            status="PAID",
+            rent_paid=Decimal("24585.00"),
+            water_paid=Decimal("2084.00"),
+        )
+        duplicate_april = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 4, 10),
+            due_date=date(2026, 4, 10),
+            base_rent=Decimal("24585.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("737.55"),
+            total_due=Decimal("25322.55"),
+            status="UNPAID",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(reverse("admin_mark_bill_paid", args=[self.current_bill.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "May 2026")
+        self.assertNotContains(response, "Apr 2026")
+        self.assertTrue(MonthlyBill.objects.filter(pk=paid_april.pk).exists())
+
+    def test_admin_billing_default_table_uses_current_month_and_overdue_filter_uses_late_balances(self):
+        today = date.today()
+        current_month = today.replace(day=1)
+        previous_month = current_month - relativedelta(months=1)
+
+        # The shared settlement fixture uses fixed historical bills. This test
+        # verifies the table counters with only its date-relative scenario.
+        self.old_bill.delete()
+        self.current_bill.delete()
+
+        current_unpaid = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=current_month,
+            due_date=today - timedelta(days=1),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10000.00"),
+            status="UNPAID",
+        )
+        partial_tenant = User.objects.create_user(
+            email="partial-admin-billing@gmail.com",
+            username="partialadminbilling",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=partial_tenant,
+            first_name="Partial",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        partial_lease = Lease.objects.create(
+            tenant=partial_tenant,
+            unit=Unit.objects.create(number="B-104", status="OCCUPIED"),
+            monthly_rent=Decimal("9000.00"),
+            due_day=25,
+            start_date=current_month,
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        current_partial = MonthlyBill.objects.create(
+            lease=partial_lease,
+            billing_month=current_month,
+            due_date=today,
+            base_rent=Decimal("9000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("9000.00"),
+            status="PARTIALLY_PAID",
+            rent_paid=Decimal("2000.00"),
+        )
+        previous_late = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=previous_month,
+            due_date=previous_month,
+            base_rent=Decimal("8000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("8000.00"),
+            status="UNPAID",
+        )
+        self.client.force_login(self.admin)
+
+        default_response = self.client.get(reverse("admin_billing"))
+
+        self.assertEqual(default_response.status_code, 200)
+        self.assertEqual(default_response.context["current_bills_count"], 2)
+        self.assertEqual(default_response.context["unpaid_count"], 0)
+        self.assertEqual(default_response.context["partial_count"], 1)
+        self.assertEqual(default_response.context["overdue_count"], 1)
+        default_ids = [bill.id for bill in default_response.context["page_obj"]]
+        self.assertIn(current_unpaid.id, default_ids)
+        self.assertIn(current_partial.id, default_ids)
+        self.assertNotIn(previous_late.id, default_ids)
+
+        overdue_response = self.client.get(reverse("admin_billing"), {"status": "OVERDUE"})
+
+        self.assertEqual(overdue_response.status_code, 200)
+        overdue_ids = [bill.id for bill in overdue_response.context["page_obj"]]
+        self.assertIn(current_unpaid.id, overdue_ids)
+        self.assertNotIn(previous_late.id, overdue_ids)
+        self.assertNotIn(current_partial.id, overdue_ids)
+
+    def test_admin_billing_shows_future_partially_paid_contract_months_when_filtered_to_that_month(self):
+        self.admin.role = User.Role.ADMIN
+        self.admin.save(update_fields=["role"])
+        today = date.today()
+        current_month = today.replace(day=1)
+        if current_month.month == 12:
+            next_month = date(current_month.year + 1, 1, 1)
+        else:
+            next_month = date(current_month.year, current_month.month + 1, 1)
+        future_partial = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=next_month,
+            due_date=next_month.replace(day=5),
+            base_rent=Decimal("10125.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("12275.00"),
+            status="PARTIALLY_PAID",
+            payment_reference="REF-MAINT-ADMIN",
+        )
+        BillLineItem.objects.create(
+            monthly_bill=future_partial,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("1800.00"),
+            paid_amount=Decimal("1800.00"),
+            payment_reference="REF-MAINT-ADMIN",
+            status=BillLineItem.STATUS_PAID,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_billing"), {
+            "q": "billing-tenant",
+            "month": str(next_month.month),
+            "year": str(next_month.year),
+            "tab": "upcoming",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        bill_ids = [bill.id for bill in response.context["page_obj"]]
+        self.assertIn(future_partial.id, bill_ids)
+        self.assertContains(response, "Includes maintenance")
+        self.assertContains(response, "1,800")
+
+    def test_admin_billing_shows_future_paid_contract_months_when_filtered_to_that_month(self):
+        today = date.today()
+        current_month = today.replace(day=1)
+        if current_month.month == 12:
+            next_month = date(current_month.year + 1, 1, 1)
+            following_month = date(current_month.year + 1, 2, 1)
+        elif current_month.month == 11:
+            next_month = date(current_month.year, 12, 1)
+            following_month = date(current_month.year + 1, 1, 1)
+        else:
+            next_month = date(current_month.year, current_month.month + 1, 1)
+            following_month = date(current_month.year, current_month.month + 2, 1)
+        future_paid = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=next_month,
+            due_date=next_month.replace(day=5),
+            base_rent=Decimal("10125.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10475.00"),
+            status="PAID",
+            rent_paid=Decimal("10475.00"),
+        )
+        future_unpaid = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=following_month,
+            due_date=following_month.replace(day=5),
+            base_rent=Decimal("10125.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10475.00"),
+            status="UNPAID",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_billing"), {
+            "q": "billing-tenant",
+            "month": str(next_month.month),
+            "year": str(next_month.year),
+            "status": "PAID",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        # Dashboard counters are scoped to the filtered queryset. The unpaid
+        # following-month bill is deliberately outside this month filter.
+        self.assertEqual(response.context["upcoming_count"], 0)
+        bill_ids = [bill.id for bill in response.context["page_obj"]]
+        self.assertIn(future_paid.id, bill_ids)
+        self.assertNotIn(future_unpaid.id, bill_ids)
+
+    def test_admin_billing_current_table_does_not_depend_on_tenant_account_creation_date(self):
+        old_tenant = User.objects.create_user(
+            email="old-admin-billing@gmail.com",
+            username="oldadminbilling",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        old_tenant.date_joined = timezone.make_aware(datetime(2024, 1, 10, 8, 0, 0))
+        old_tenant.save(update_fields=["date_joined"])
+        TenantProfile.objects.create(
+            user=old_tenant,
+            first_name="Older",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        old_unit = Unit.objects.create(number="B-102", status="OCCUPIED")
+        old_lease = Lease.objects.create(
+            tenant=old_tenant,
+            unit=old_unit,
+            monthly_rent=Decimal("9800.00"),
+            due_day=5,
+            start_date=date.today().replace(day=1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+        new_tenant = User.objects.create_user(
+            email="new-admin-billing@gmail.com",
+            username="newadminbilling",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=new_tenant,
+            first_name="Newer",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        new_unit = Unit.objects.create(number="B-103", status="OCCUPIED")
+        new_lease = Lease.objects.create(
+            tenant=new_tenant,
+            unit=new_unit,
+            monthly_rent=Decimal("9900.00"),
+            due_day=5,
+            start_date=date.today().replace(day=1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+        today = timezone.localdate()
+        ensure_current_month_bill_for_lease(old_lease, today=today)
+        ensure_current_month_bill_for_lease(new_lease, today=today)
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_billing"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["current_bills_count"], 2)
+        bill_ids = [bill.id for bill in response.context["page_obj"]]
+        self.assertIn(MonthlyBill.objects.get(lease=old_lease, billing_month=today.replace(day=1)).id, bill_ids)
+        self.assertIn(MonthlyBill.objects.get(lease=new_lease, billing_month=today.replace(day=1)).id, bill_ids)
+
+
+class AdminNotificationBehaviorTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="admin-notify@gmail.com",
+            username="adminnotify",
+            password="password123",
+        )
+        self.staff = User.objects.create_user(
+            email="notify-staff@gmail.com",
+            username="notifystaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="notify-tenant@gmail.com",
+            username="notifytenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Notify",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+
+    def test_delete_all_read_notifications_keeps_unread(self):
+        read_notification = Notification.objects.create(
+            title="Read",
+            message="Done",
+            notification_type="SYSTEM",
+            recipient_type="ADMIN",
+            is_read=True,
+            read_at=timezone.now(),
+        )
+        unread_notification = Notification.objects.create(
+            title="Unread",
+            message="Pending",
+            notification_type="SYSTEM",
+            recipient_type="ADMIN",
+            is_read=False,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(reverse("admin_delete_all_read_notifications"))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(Notification.objects.filter(pk=read_notification.pk).exists())
+        self.assertTrue(Notification.objects.filter(pk=unread_notification.pk).exists())
+
+    def test_old_read_notifications_are_purged_on_admin_notification_page(self):
+        old_read = Notification.objects.create(
+            title="Old Read",
+            message="Old",
+            notification_type="SYSTEM",
+            recipient_type="ADMIN",
+            is_read=True,
+            read_at=timezone.now() - timedelta(days=2),
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_notifications"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Notification.objects.filter(pk=old_read.pk).exists())
+
+    def test_admin_can_delete_single_notification_without_password_prompt(self):
+        notification = Notification.objects.create(
+            title="Delete Me",
+            message="Done",
+            notification_type="SYSTEM",
+            recipient_type="ADMIN",
+            is_read=True,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(reverse("admin_delete_notification", args=[notification.id]))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(Notification.objects.filter(pk=notification.pk).exists())
+
+    def test_staff_can_delete_own_notification_without_password_prompt(self):
+        notification = Notification.objects.create(
+            title="Staff Delete",
+            message="Assigned task updated",
+            notification_type="SYSTEM",
+            recipient_type="SPECIFIC_USER",
+            user=self.staff,
+            is_read=True,
+        )
+        self.client.force_login(self.staff)
+
+        response = self.client.post(reverse("admin_delete_notification", args=[notification.id]))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(Notification.objects.filter(pk=notification.pk).exists())
+
+    def test_payment_notifications_show_view_for_approved_and_approve_for_pending(self):
+        approved_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="PAY-APPROVED-1",
+            payment_method="PAYMONGO",
+            payment_type="full",
+            amount=Decimal("1000.00"),
+            status="APPROVED",
+        )
+        pending_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="PAY-PENDING-1",
+            payment_method="GCASH",
+            payment_type="full",
+            amount=Decimal("1000.00"),
+            status="PENDING",
+        )
+        Notification.objects.create(
+            title="Approved PayMongo",
+            message=f"Reference: {approved_payment.reference_code}. Paid.",
+            notification_type="PAYMENT",
+            recipient_type="ADMIN",
+            related_tenant=self.tenant,
+        )
+        Notification.objects.create(
+            title="Pending GCash",
+            message=f"Reference: {pending_payment.reference_code}. Please review.",
+            notification_type="PAYMENT",
+            recipient_type="ADMIN",
+            related_tenant=self.tenant,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_notifications"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "View Payment")
+        self.assertContains(response, "Approve Payment")
+
+    def test_payment_reference_label_still_resolves_payment_link(self):
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-MOVEIN-LINK",
+            payment_method="PAYMONGO",
+            payment_type="move_in",
+            amount=Decimal("45700.00"),
+            status="APPROVED",
+        )
+        notification = Notification.objects.create(
+            title="Move-in payment received",
+            message="Payment reference: REF-MOVEIN-LINK",
+            notification_type="PAYMENT",
+            recipient_type="ADMIN",
+            related_tenant=self.tenant,
+        )
+
+        target_url = resolve_notification_target_url(notification)
+
+        self.assertEqual(target_url, reverse("admin_payment_detail", args=[payment.id]))
+
+    def test_new_maintenance_copy_keeps_existing_maintenance_list_action(self):
+        MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            category="PLUMBING",
+            title="Leaking sink",
+            description="The sink is leaking.",
+        )
+        notification = Notification.objects.create(
+            title="Maintenance request received",
+            message="Maintenance request: Leaking sink\nNotify Tenant sent a plumbing request for Unit A-2.",
+            notification_type="MAINTENANCE",
+            recipient_type="ADMIN",
+            related_tenant=self.tenant,
+        )
+
+        target_url = resolve_notification_target_url(notification)
+
+        self.assertEqual(target_url, reverse("admin_maintenance"))
+
+    def test_cash_schedule_notification_without_reference_prefers_pending_cash_payment(self):
+        cash_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-F2F-CASH",
+            payment_method="CASH",
+            payment_type="rent_only",
+            amount=Decimal("9000.00"),
+            status="PENDING",
+        )
+        ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-PM-NEWER",
+            payment_method="PAYMONGO",
+            payment_type="rent_only",
+            amount=Decimal("9000.00"),
+            status="APPROVED",
+        )
+        notification = Notification.objects.create(
+            title="Cash Payment Scheduled",
+            message=(
+                f"{self.tenant.email} requested F2F cash payment of ₱9000.0 "
+                "on Jun 04, 2026 at 01:00 PM. Please confirm availability."
+            ),
+            notification_type="PAYMENT",
+            recipient_type="ADMIN",
+            related_tenant=self.tenant,
+        )
+
+        target_url = resolve_notification_target_url(notification)
+
+        self.assertEqual(target_url, reverse("admin_payment_detail", args=[cash_payment.id]))
+        self.assertEqual(notification.target_label, "Approve Payment")
+
+    def test_new_cash_payment_copy_keeps_pending_payment_action_available_without_reference(self):
+        cash_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-CASH-NO-MESSAGE-REF",
+            payment_method="CASH",
+            payment_type="rent_only",
+            amount=Decimal("9000.00"),
+            status="PENDING",
+        )
+        notification = Notification.objects.create(
+            title="Cash payment requested",
+            message="Tenant requested an appointment.",
+            notification_type="PAYMENT",
+            recipient_type="ADMIN",
+            related_tenant=self.tenant,
+        )
+
+        target_url = resolve_notification_target_url(notification)
+
+        self.assertEqual(target_url, reverse("admin_payment_detail", args=[cash_payment.id]))
+        self.assertEqual(notification.target_label, "Approve Payment")
+
+    def test_admin_notifications_exclude_tenant_specific_notifications(self):
+        Notification.create_tenant_notification(
+            title="Welcome to Your New Unit 102!",
+            message="Tenant-only welcome details.",
+            notification_type="SYSTEM",
+            tenant_user=self.tenant,
+        )
+        Notification.objects.create(
+            title="Admin Lease Audit",
+            message="Admin lease audit.",
+            notification_type="LEASE",
+            recipient_type="ADMIN",
+            related_tenant=self.tenant,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_notifications"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Admin Lease Audit")
+        self.assertNotContains(response, "Welcome to Your New Unit 102!")
+
+
+class TenantPortalBoundaryTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="boundary-admin@gmail.com",
+            username="boundaryadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.tenant = User.objects.create_user(
+            email="boundary-tenant@gmail.com",
+            username="boundarytenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+
+    def test_admin_is_redirected_away_from_tenant_dashboard(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("tenant_dashboard"))
+
+        self.assertRedirects(response, reverse("admin_dashboard"))
+        messages = list(response.wsgi_request._messages)
+        self.assertTrue(any("tenant portal" in str(message).lower() for message in messages))
+
+    def test_admin_is_redirected_away_from_tenant_maintenance(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("maintenance_list"))
+
+        self.assertRedirects(response, reverse("admin_dashboard"))
+        messages = list(response.wsgi_request._messages)
+        self.assertTrue(any("tenant portal" in str(message).lower() for message in messages))
+
+    def test_admin_is_redirected_away_from_tenant_payment_checkout(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("paymongo_checkout"))
+
+        self.assertRedirects(response, reverse("admin_dashboard"))
+        messages = list(response.wsgi_request._messages)
+        self.assertTrue(any("tenant portal" in str(message).lower() for message in messages))
+
+    def test_tenant_is_redirected_away_from_admin_dashboard(self):
+        self.client.force_login(self.tenant)
+
+        response = self.client.get(reverse("admin_dashboard"))
+
+        self.assertRedirects(response, reverse("tenant_dashboard"))
+        messages = list(response.wsgi_request._messages)
+        self.assertTrue(any("operational area" in str(message).lower() for message in messages))
+
+
+class TenantNotificationBehaviorTests(TestCase):
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="tenant-notify@gmail.com",
+            username="tenantnotify",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Tenant",
+            last_name="Notify",
+            password_change_required=False,
+            created_by=None,
+        )
+
+    def test_pending_lease_notification_renders_compact_payment_details(self):
+        title, message = notification_copy.pending_lease_welcome_notification_copy(
+            unit="301",
+            security_deposit=Decimal("12000.00"),
+            total_move_in_cost=Decimal("45700.00"),
+            start_date="June 1, 2026",
+        )
+        notification = Notification.objects.create(
+            title=title,
+            message=message,
+            notification_type="SYSTEM",
+            recipient_type="TENANT",
+            user=self.tenant,
+            is_read=False,
+        )
+        self.client.force_login(self.tenant)
+
+        response = self.client.get(reverse("tenant_notifications"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Your lease for Unit 301 is ready")
+        self.assertContains(response, "LEASE")
+        self.assertContains(response, "Your move-in payment is still pending.")
+        self.assertContains(response, "Please complete the required payment to activate your lease.")
+        self.assertContains(response, "Move-in payment")
+        self.assertContains(response, "₱45,700.00")
+        self.assertContains(response, "Lease starts")
+        self.assertContains(response, "June 1, 2026")
+        self.assertContains(response, "Security deposit")
+        self.assertContains(response, "₱12,000.00 · Due upon move-in")
+        self.assertNotContains(response, "Amenities")
+        self.assertContains(response, "Mark Read")
+        self.assertEqual(notification.notification_type, "SYSTEM")
+        self.assertFalse(notification.is_read)
+
+    def test_tenant_can_delete_read_notification(self):
+        notification = Notification.objects.create(
+            title="Read",
+            message="Done",
+            notification_type="SYSTEM",
+            recipient_type="TENANT",
+            user=self.tenant,
+            is_read=True,
+        )
+        self.client.force_login(self.tenant)
+
+        response = self.client.post(reverse("delete_notification", args=[notification.id]))
+
+        self.assertRedirects(response, reverse("tenant_notifications"))
+        self.assertFalse(Notification.objects.filter(pk=notification.pk).exists())
+
+    def test_tenant_cannot_delete_unread_notification(self):
+        notification = Notification.objects.create(
+            title="Unread",
+            message="Pending",
+            notification_type="SYSTEM",
+            recipient_type="TENANT",
+            user=self.tenant,
+            is_read=False,
+        )
+        self.client.force_login(self.tenant)
+
+        response = self.client.post(reverse("delete_notification", args=[notification.id]))
+
+        self.assertRedirects(response, reverse("tenant_notifications"))
+        self.assertTrue(Notification.objects.filter(pk=notification.pk).exists())
+        messages = list(response.wsgi_request._messages)
+        self.assertTrue(any("already marked as read" in str(message).lower() for message in messages))
+
+    def test_tenant_can_delete_all_read_notifications_without_touching_unread(self):
+        read_notification = Notification.objects.create(
+            title="Read",
+            message="Done",
+            notification_type="SYSTEM",
+            recipient_type="TENANT",
+            user=self.tenant,
+            is_read=True,
+        )
+        unread_notification = Notification.objects.create(
+            title="Unread",
+            message="Pending",
+            notification_type="SYSTEM",
+            recipient_type="TENANT",
+            user=self.tenant,
+            is_read=False,
+        )
+        self.client.force_login(self.tenant)
+
+        response = self.client.post(reverse("delete_all_read_notifications"))
+
+        self.assertRedirects(response, reverse("tenant_notifications"))
+        self.assertFalse(Notification.objects.filter(pk=read_notification.pk).exists())
+        self.assertTrue(Notification.objects.filter(pk=unread_notification.pk).exists())
+
+
+class AdminMaintenanceDisplayTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="maintenance-admin@gmail.com",
+            username="maintenanceadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.tenant = User.objects.create_user(
+            email="sophia.sinco@gmail.com",
+            username="sophiasinco",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Sophia",
+            last_name="Sinco",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(
+            number="107",
+            status="OCCUPIED",
+            monthly_rent=Decimal("10000.00"),
+        )
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=timezone.localdate().replace(day=1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=False,
+        )
+
+    def test_admin_maintenance_page_archives_request_without_lease(self):
+        request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=None,
+            category="ELECTRICAL",
+            title="Light issue",
+            description="Ceiling light exploded.",
+            priority="MEDIUM",
+            status="OPEN",
+            review_status="PENDING",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_maintenance"))
+
+        self.assertEqual(response.status_code, 200)
+        request_obj.refresh_from_db()
+        self.assertEqual(request_obj.status, "CLOSED")
+        self.assertEqual(request_obj.review_status, "REJECTED")
+        self.assertNotContains(response, "Sophia Sinco")
+        self.assertContains(response, "No requests found")
+
+    def test_admin_maintenance_page_excludes_orphaned_request_even_if_tenant_has_stale_latest_lease(self):
+        self.lease.status = Lease.STATUS_PENDING_PAYMENT
+        self.lease.save(update_fields=["status"])
+        request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=None,
+            category="PLUMBING",
+            title="Water leak",
+            description="Water leak in cr",
+            priority="MEDIUM",
+            status="OPEN",
+            review_status="PENDING",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_maintenance"))
+
+        self.assertEqual(response.status_code, 200)
+        request_obj.refresh_from_db()
+        self.assertEqual(request_obj.status, "CLOSED")
+        self.assertEqual(request_obj.review_status, "REJECTED")
+        self.assertNotContains(response, "Sophia Sinco")
+        self.assertContains(response, "No requests found")
+
+
+class AdminForecastingRevenueTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="forecast-admin@gmail.com",
+            username="forecastadmin",
+            password="password123",
+        )
+        self.tenant = User.objects.create_user(
+            email="forecast-tenant@gmail.com",
+            username="forecasttenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Forecast",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(number="F-101", status="OCCUPIED")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("300000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+    def test_forecasting_actual_revenue_uses_collected_amount_not_billed_amount(self):
+        target_month = (timezone.now().date().replace(day=1) - timedelta(days=1)).replace(day=1)
+        MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=target_month,
+            due_date=target_month.replace(day=5),
+            base_rent=Decimal("300000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("300000.00"),
+            rent_paid=Decimal("114000.00"),
+            status="PARTIALLY_PAID",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_forecasting_data"))
+
+        self.assertEqual(response.status_code, 200)
+        target_label = target_month.strftime("%b %Y")
+        payload = response.json()
+        month_index = payload["hist_labels"].index(target_label)
+        self.assertEqual(payload["hist_revenue"][month_index], 114000.0)
+
+    def test_forecasting_payload_includes_model_comparison_fields(self):
+        target_month = timezone.now().date().replace(day=1)
+        for offset in range(1, 20):
+            month = (target_month.replace(day=1) - relativedelta(months=offset))
+            MonthlyBill.objects.create(
+                lease=self.lease,
+                billing_month=month,
+                due_date=month.replace(day=5),
+                base_rent=Decimal("300000.00"),
+                water_amount=Decimal("0.00"),
+                parking_fee=Decimal("0.00"),
+                interest=Decimal("0.00"),
+                total_due=Decimal("300000.00"),
+                rent_paid=Decimal(str(100000 + (offset * 1000))),
+                status="PAID",
+            )
+
+        self.client.force_login(self.admin)
+        response = self.client.get(reverse("admin_forecasting_data"))
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("rev_naive_fc", payload)
+        self.assertIn("rev_arima_fc", payload)
+        self.assertIn("rev_sarima_fc", payload)
+        self.assertIn("revenue_naive_metrics", payload)
+        self.assertIn("revenue_arima_metrics", payload)
+        self.assertIn("revenue_sarima_metrics", payload)
+        self.assertIn("selected_model", payload)
+        self.assertIn("history_month_count", payload)
+        self.assertIn("history_range_label", payload)
+        self.assertIn("forecast_horizon", payload)
+        self.assertIn("selected_model_order", payload)
+        self.assertIn("selected_model_seasonal_order", payload)
+        self.assertEqual(payload["selected_model"], "SARIMA")
+
+    @patch("accounts.admin_forecasting_views.timezone.now")
+    def test_forecasting_uses_last_complete_month_and_starts_forecast_after_it(self, mocked_now):
+        mocked_now.return_value = timezone.make_aware(datetime(2026, 7, 3, 10, 0, 0))
+        june_month = date(2026, 6, 1)
+        july_month = date(2026, 7, 1)
+        MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=june_month,
+            due_date=date(2026, 6, 5),
+            base_rent=Decimal("300000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("300000.00"),
+            rent_paid=Decimal("234567.00"),
+            status="PAID",
+        )
+        MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=july_month,
+            due_date=date(2026, 7, 5),
+            base_rent=Decimal("300000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("300000.00"),
+            rent_paid=Decimal("99999.00"),
+            status="PARTIALLY_PAID",
+        )
+        request = RequestFactory().get(reverse("admin_forecasting"), {"year": "2026"})
+        context = _build_forecasting_context(request)
+
+        self.assertEqual(context["hist_labels"][-1], "Jun 2026")
+        self.assertEqual(context["hist_revenue"][-1], 234567.0)
+        self.assertEqual(context["forecast_labels"][0], "Jul 2026")
+        self.assertNotIn("Jul 2026", context["hist_labels"])
+
+
+class AdminTenantPaymentHistoryTests(TestCase):
+    def test_tenant_detail_payment_history_excludes_future_unpaid_bills_but_keeps_paid_future(self):
+        admin = User.objects.create_superuser(
+            email="history-admin@gmail.com",
+            username="historyadmin",
+            password="password123",
+        )
+        tenant_user = User.objects.create_user(
+            email="history-tenant@gmail.com",
+            username="historytenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        tenant = TenantProfile.objects.create(
+            user=tenant_user,
+            first_name="History",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        unit = Unit.objects.create(number="H-101", status="OCCUPIED")
+        lease = Lease.objects.create(
+            tenant=tenant_user,
+            unit=unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=timezone.localdate().replace(day=1),
+            due_date=timezone.localdate().replace(day=5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10000.00"),
+            status="PAID",
+        )
+        MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=date(2026, 11, 1),
+            due_date=date(2026, 11, 5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10000.00"),
+            status="UNPAID",
+        )
+        MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=date(2026, 7, 1),
+            due_date=date(2026, 7, 5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10000.00"),
+            status="PAID",
+        )
+        self.client.force_login(admin)
+
+        response = self.client.get(reverse("admin_tenant_detail", args=[tenant.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, timezone.localdate().replace(day=1).strftime("%b %Y"))
+        self.assertContains(response, "Jul 2026")
+        self.assertNotContains(response, "Nov 2026")
+
+
+class AdminTenantMonthlyLedgerPaymentMethodTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="monthly-ledger-admin@example.com",
+            username="monthlyledgeradmin",
+            password="password123",
+        )
+        self.tenant = User.objects.create_user(
+            email="monthly-ledger-tenant@example.com",
+            username="monthlyledgertenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.profile = TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Ledger",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=self.admin,
+        )
+        self.unit = Unit.objects.create(number="PM-101", status="OCCUPIED")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=timezone.localdate().replace(day=1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.client.force_login(self.admin)
+
+    def _create_bill(self, *, status="PAID"):
+        month = timezone.localdate().replace(day=1)
+        return MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=month,
+            due_date=month.replace(day=5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("500.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10500.00"),
+            rent_paid=(
+                Decimal("5000.00")
+                if status == "PARTIALLY_PAID"
+                else Decimal("10000.00") if status == "PAID" else Decimal("0.00")
+            ),
+            water_paid=Decimal("500.00") if status == "PAID" else Decimal("0.00"),
+            status=status,
+        )
+
+    def _add_payment(self, bill, *, method, paid_via="", status="APPROVED", payment_type="full", amount=Decimal("10500.00")):
+        return ManualPayment.objects.create(
+            user=self.tenant,
+            bill_ids=str(bill.pk),
+            payment_type=payment_type,
+            payment_method=method,
+            paid_via=paid_via,
+            amount=amount,
+            status=status,
+            reference_code=f"LEDGER-{method}-{ManualPayment.objects.count() + 1}",
+        )
+
+    def _detail_response(self):
+        return self.client.get(reverse("admin_tenant_detail", args=[self.profile.pk]))
+
+    def test_paid_gcash_bill_shows_human_readable_method_without_changing_amount_or_status(self):
+        bill = self._create_bill()
+        self._add_payment(bill, method="GCASH")
+
+        response = self._detail_response()
+
+        displayed_bill = response.context["bill_history"][0]
+        self.assertEqual(displayed_bill.payment_method_label, "GCash")
+        self.assertEqual(displayed_bill.payment_method_provider, "")
+        self.assertEqual(displayed_bill.total_due, Decimal("10500.00"))
+        self.assertEqual(displayed_bill.status, "PAID")
+        self.assertContains(response, "Payment Method")
+        self.assertContains(response, "GCash")
+        self.assertContains(response, "10,500")
+
+    def test_paymongo_gcash_shows_actual_method_and_provider_secondary(self):
+        bill = self._create_bill()
+        self._add_payment(bill, method="PAYMONGO", paid_via="gcash")
+
+        response = self._detail_response()
+
+        displayed_bill = response.context["bill_history"][0]
+        self.assertEqual(displayed_bill.payment_method_label, "GCash")
+        self.assertEqual(displayed_bill.payment_method_provider, "via PayMongo")
+        self.assertContains(response, "GCash")
+        self.assertContains(response, "via PayMongo")
+
+    def test_paymongo_without_known_channel_uses_truthful_provider_fallback(self):
+        bill = self._create_bill()
+        self._add_payment(bill, method="PAYMONGO", paid_via="unknown")
+
+        response = self._detail_response()
+
+        displayed_bill = response.context["bill_history"][0]
+        self.assertEqual(displayed_bill.payment_method_label, "PayMongo")
+        self.assertEqual(displayed_bill.payment_method_provider, "")
+        self.assertContains(response, "PayMongo")
+
+    def test_cash_payment_shows_cash(self):
+        bill = self._create_bill()
+        self._add_payment(bill, method="CASH")
+
+        response = self._detail_response()
+
+        self.assertEqual(response.context["bill_history"][0].payment_method_label, "Cash")
+
+    def test_unpaid_bill_without_approved_payment_shows_dash(self):
+        bill = self._create_bill(status="UNPAID")
+        self._add_payment(bill, method="CASH", status="PENDING", amount=Decimal("1000.00"))
+
+        response = self._detail_response()
+
+        displayed_bill = response.context["bill_history"][0]
+        self.assertEqual(displayed_bill.payment_method_label, "")
+        self.assertEqual(displayed_bill.status, "UNPAID")
+        self.assertContains(response, "—")
+
+    def test_multiple_approved_methods_are_listed_once_and_not_guessed(self):
+        bill = self._create_bill()
+        self._add_payment(bill, method="PAYMONGO", paid_via="gcash", amount=Decimal("5250.00"))
+        self._add_payment(bill, method="CASH", amount=Decimal("5250.00"))
+
+        response = self._detail_response()
+
+        displayed_bill = response.context["bill_history"][0]
+        self.assertEqual(displayed_bill.payment_method_label, "GCash + Cash")
+        self.assertEqual(displayed_bill.payment_method_provider, "Includes PayMongo")
+        self.assertContains(response, "GCash + Cash")
+
+    def test_partial_bill_shows_method_as_partial_without_changing_status(self):
+        bill = self._create_bill(status="PARTIALLY_PAID")
+        self._add_payment(bill, method="CASH", amount=Decimal("5000.00"))
+
+        response = self._detail_response()
+
+        displayed_bill = response.context["bill_history"][0]
+        self.assertEqual(displayed_bill.payment_method_label, "Cash")
+        self.assertEqual(displayed_bill.status, "PARTIALLY_PAID")
+        self.assertEqual(displayed_bill.total_due, Decimal("10500.00"))
+        self.assertContains(response, "Partial payment")
+        self.assertContains(response, "PARTIAL")
+
+    def test_confirmed_contract_event_table_remains_unchanged(self):
+        bill = self._create_bill()
+        monthly_payment = self._add_payment(bill, method="CASH")
+        move_in_payment = ManualPayment.objects.create(
+            user=self.tenant,
+            lease=self.lease,
+            payment_type="move_in",
+            payment_method="PAYMONGO",
+            paid_via="gcash",
+            amount=Decimal("10000.00"),
+            status="APPROVED",
+            reference_code="MOVE-IN-LEDGER",
+        )
+        LeaseContractEvent.objects.create(
+            lease=self.lease,
+            event_type=LeaseContractEvent.EVENT_TYPE_MOVE_IN_PAYMENT,
+            status=LeaseContractEvent.STATUS_APPROVED,
+            occurred_at=timezone.now(),
+            source_payment=move_in_payment,
+            payment_reference=move_in_payment.reference_code,
+            payment_method="GCash",
+            amount=move_in_payment.amount,
+        )
+
+        response = self._detail_response()
+
+        self.assertEqual(response.context["contract_events"][0].payment_method, "GCash")
+        self.assertEqual(response.context["bill_history"][0].payment_method_label, "Cash")
+        self.assertContains(response, "Confirmed contract events")
+        self.assertEqual(monthly_payment.payment_method, "CASH")
+
+
+class AdminTenantAndUnitSearchTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="admin-search@gmail.com",
+            username="adminsearch",
+            password="password123",
+        )
+        self.tenant_john = User.objects.create_user(
+            email="john.constantine@gmail.com",
+            username="johnconstantine",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant_john,
+            first_name="John",
+            last_name="Constantine",
+            contact_no="09170000001",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.tenant_mary = User.objects.create_user(
+            email="mary.sue@gmail.com",
+            username="marysue",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant_mary,
+            first_name="Mary",
+            last_name="Sue",
+            contact_no="09170000002",
+            password_change_required=False,
+            created_by=None,
+        )
+
+    def test_admin_tenant_search_supports_multi_word_queries(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/tenants/?q=John+C")
+
+        self.assertEqual(response.status_code, 200)
+        tenant_ids = [tenant.id for tenant in response.context["page_obj"]]
+        self.assertIn(self.tenant_john.tenantprofile.id, tenant_ids)
+        self.assertNotIn(self.tenant_mary.tenantprofile.id, tenant_ids)
+
+    def test_admin_tenant_list_marks_pending_lease_as_awaiting_move_in(self):
+        unit = Unit.objects.create(number="TNT-PEND", monthly_rent=Decimal("10000.00"))
+        Lease.objects.create(
+            tenant=self.tenant_john,
+            unit=unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=timezone.localdate(),
+            status=Lease.STATUS_PENDING_PAYMENT,
+            is_active=False,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_tenants"))
+
+        self.assertEqual(response.status_code, 200)
+        john = next(t for t in response.context["page_obj"] if t.pk == self.tenant_john.tenantprofile.pk)
+        self.assertFalse(john.has_active_lease)
+        self.assertTrue(john.has_pending_move_in)
+        self.assertContains(response, "Awaiting Move-in")
+
+        pending_response = self.client.get(reverse("admin_tenants"), {"lease": "pending"})
+        self.assertEqual(
+            [tenant.pk for tenant in pending_response.context["page_obj"]],
+            [self.tenant_john.tenantprofile.pk],
+        )
+
+    def test_admin_tenant_detail_back_url_preserves_search_state(self):
+        self.client.force_login(self.admin)
+        next_url = "/admin-portal/tenants/?q=John+C&lease=active&page=2"
+
+        response = self.client.get(
+            f"/admin-portal/tenants/{self.tenant_john.tenantprofile.id}/?next=%2Fadmin-portal%2Ftenants%2F%3Fq%3DJohn%2BC%26lease%3Dactive%26page%3D2"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["back_url"], next_url)
+
+    def test_admin_tenant_detail_shows_contract_start_and_end_dates(self):
+        unit = Unit.objects.create(number="605", monthly_rent=Decimal("14060.00"))
+        Lease.objects.create(
+            tenant=self.tenant_john,
+            unit=unit,
+            monthly_rent=Decimal("14060.00"),
+            due_day=16,
+            start_date=date(2026, 6, 16),
+            end_date=date(2027, 6, 16),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_tenant_detail", args=[self.tenant_john.tenantprofile.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Contract Dates")
+        self.assertContains(response, "In: Jun 16, 2026")
+        self.assertContains(response, "Jun 16, 2027")
+
+    def test_admin_tenant_detail_contract_ledger_labels_partial_and_excludes_future_unpaid(self):
+        today = date.today()
+        current_month = today.replace(day=1)
+        next_month = (
+            date(current_month.year + 1, 1, 1)
+            if current_month.month == 12
+            else date(current_month.year, current_month.month + 1, 1)
+        )
+        unit = Unit.objects.create(number="606", monthly_rent=Decimal("10000.00"))
+        lease = Lease.objects.create(
+            tenant=self.tenant_john,
+            unit=unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=current_month,
+            end_date=next_month,
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=current_month,
+            due_date=current_month.replace(day=5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("500.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10500.00"),
+            rent_paid=Decimal("10000.00"),
+            status="PARTIALLY_PAID",
+        )
+        MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=next_month,
+            due_date=next_month.replace(day=5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("0.00"),
+            parking_fee=Decimal("0.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("10000.00"),
+            status="UNPAID",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_tenant_detail", args=[self.tenant_john.tenantprofile.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Contract Ledger")
+        self.assertContains(response, "PARTIAL")
+        self.assertNotContains(response, next_month.strftime("%b %Y"))
+
+    def test_admin_tenant_detail_orders_ledger_from_start_and_shows_payment_covered_month(self):
+        unit = Unit.objects.create(number="607", monthly_rent=Decimal("10000.00"))
+        lease = Lease.objects.create(
+            tenant=self.tenant_john,
+            unit=unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            end_date=date(2026, 8, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        june_bill = MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=date(2026, 6, 1),
+            due_date=date(2026, 6, 5),
+            base_rent=Decimal("10000.00"),
+            total_due=Decimal("10000.00"),
+            status="PAID",
+        )
+        august_bill = MonthlyBill.objects.create(
+            lease=lease,
+            billing_month=date(2026, 8, 1),
+            due_date=date(2026, 8, 5),
+            base_rent=Decimal("10000.00"),
+            total_due=Decimal("10000.00"),
+            status="PAID",
+        )
+        ManualPayment.objects.create(
+            user=self.tenant_john,
+            bill_ids=f"{june_bill.id},{august_bill.id}",
+            payment_type="full",
+            payment_method="PAYMONGO",
+            amount=Decimal("20000.00"),
+            status="APPROVED",
+            reference_code="REF-COVERED-MONTHS",
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_tenant_detail", args=[self.tenant_john.tenantprofile.id]))
+
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertLess(content.index("Jun 2026"), content.index("Aug 2026"))
+        self.assertContains(response, "Jun 2026 - Aug 2026")
+
+    def test_admin_units_search_no_longer_raises_q_error(self):
+        Unit.objects.create(number="700", monthly_rent=Decimal("10000.00"), status="AVAILABLE")
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/units/?search=700&status=all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(response.context["page_obj"].paginator.count, 1)
+
+    def test_admin_can_open_inactive_maintenance_unit_detail(self):
+        unit = Unit.objects.create(
+            number="702",
+            monthly_rent=Decimal("10000.00"),
+            status="MAINTENANCE",
+            is_active=False,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(f"/admin-portal/units/{unit.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["unit"], unit)
+
+    def test_admin_cannot_open_inactive_non_maintenance_unit_detail(self):
+        unit = Unit.objects.create(
+            number="703",
+            monthly_rent=Decimal("10000.00"),
+            status="AVAILABLE",
+            is_active=False,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(f"/admin-portal/units/{unit.id}/")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_admin_can_open_inactive_occupied_unit_with_active_lease(self):
+        unit = Unit.objects.create(
+            number="704",
+            monthly_rent=Decimal("10000.00"),
+            status="OCCUPIED",
+            is_active=False,
+        )
+        Lease.objects.create(
+            tenant=self.tenant_john,
+            unit=unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(f"/admin-portal/units/{unit.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["unit"], unit)
+
+    def test_admin_can_restore_inactive_occupied_unit_with_active_lease(self):
+        unit = Unit.objects.create(
+            number="705",
+            monthly_rent=Decimal("10000.00"),
+            status="OCCUPIED",
+            is_active=False,
+        )
+        Lease.objects.create(
+            tenant=self.tenant_john,
+            unit=unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(f"/admin-portal/units/{unit.id}/restore/")
+
+        unit.refresh_from_db()
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(unit.is_active)
+        self.assertEqual(unit.status, "OCCUPIED")
+
+    def test_pending_payment_unit_card_shows_pending_tenant_not_missing_info(self):
+        unit = Unit.objects.create(
+            number="706",
+            monthly_rent=Decimal("10000.00"),
+            status="OCCUPIED",
+        )
+        Lease.objects.create(
+            tenant=self.tenant_john,
+            unit=unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_PENDING_PAYMENT,
+            is_active=False,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get("/admin-portal/units/?search=706&status=all")
+
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn("John Constantine", content)
+        self.assertIn("Pending Payment", content)
+        self.assertIn("Awaiting Move-in", content)
+        self.assertNotIn("Reserved", content)
+        self.assertNotIn("Occupied (missing info)", content)
+
+    def test_new_lease_form_blocks_occupied_units(self):
+        occupied_unit = Unit.objects.create(number="701", monthly_rent=Decimal("12000.00"), status="OCCUPIED")
+        tenant = User.objects.create_user(
+            email="tenant.form@gmail.com",
+            username="tenantform",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=tenant,
+            first_name="Tenant",
+            last_name="Form",
+            password_change_required=False,
+            created_by=None,
+        )
+        occupied_tenant = User.objects.create_user(
+            email="occupied.tenant.form@gmail.com",
+            username="occupiedtenantform",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        Lease.objects.create(
+            tenant=occupied_tenant,
+            unit=occupied_unit,
+            monthly_rent=Decimal("12000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        form = LeaseForm(
+            data={
+                "tenant": tenant.id,
+                "unit": occupied_unit.id,
+                "monthly_rent": "12000.00",
+                "due_day": "5",
+                "start_date": "2026-06-01",
+                "end_date": "2027-06-01",
+                "security_deposit": "24000.00",
+                "motorcycle_slots": "0",
+                "car_slots": "0",
+            }
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("unit", form.errors)
+
+    def test_new_lease_form_excludes_tenants_with_active_or_pending_leases(self):
+        available_tenant = User.objects.create_user(
+            email="available.tenant@gmail.com",
+            username="availabletenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        active_tenant = User.objects.create_user(
+            email="active.tenant@gmail.com",
+            username="activetenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        pending_tenant = User.objects.create_user(
+            email="pending.tenant@gmail.com",
+            username="pendingtenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        for tenant, first in [
+            (available_tenant, "Available"),
+            (active_tenant, "Active"),
+            (pending_tenant, "Pending"),
+        ]:
+            TenantProfile.objects.create(user=tenant, first_name=first, last_name="Tenant")
+
+        active_unit = Unit.objects.create(number="707", monthly_rent=Decimal("10000.00"), status="OCCUPIED")
+        pending_unit = Unit.objects.create(number="708", monthly_rent=Decimal("10000.00"), status="AVAILABLE")
+        Lease.objects.create(
+            tenant=active_tenant,
+            unit=active_unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        Lease.objects.create(
+            tenant=pending_tenant,
+            unit=pending_unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_PENDING_PAYMENT,
+            is_active=False,
+        )
+
+        form = LeaseForm()
+        tenant_ids = set(form.fields["tenant"].queryset.values_list("id", flat=True))
+
+        self.assertIn(available_tenant.id, tenant_ids)
+        self.assertNotIn(active_tenant.id, tenant_ids)
+        self.assertNotIn(pending_tenant.id, tenant_ids)
+
+    def _unit_form_data(self, *, number, unit_type, description=""):
+        return {
+            "number": number,
+            "unit_type": unit_type,
+            "floor_level": "1",
+            "size_sqm": "25.00",
+            "monthly_rent": "12000.00",
+            "status": "AVAILABLE",
+            "is_active": "on",
+            "description": description,
+            "amenities": "WiFi",
+        }
+
+    def test_admin_create_unit_preserves_all_model_unit_types(self):
+        self.client.force_login(self.admin)
+
+        for index, (unit_type, _label) in enumerate(Unit.UNIT_TYPES, start=1):
+            number = f"UT{index:03d}"
+            with self.subTest(unit_type=unit_type):
+                response = self.client.post(
+                    reverse("admin_create_unit"),
+                    self._unit_form_data(number=number, unit_type=unit_type),
+                )
+
+                self.assertRedirects(response, reverse("admin_units"))
+                self.assertEqual(Unit.objects.get(number=number).unit_type, unit_type)
+
+    def test_admin_edit_unit_preserves_existing_non_two_bedroom_types(self):
+        self.client.force_login(self.admin)
+
+        for index, unit_type in enumerate(("STUDIO", "3BR", "PENTHOUSE"), start=1):
+            unit = Unit.objects.create(
+                number=f"UE{index:03d}",
+                unit_type=unit_type,
+                monthly_rent=Decimal("12000.00"),
+            )
+            with self.subTest(unit_type=unit_type):
+                response = self.client.post(
+                    reverse("admin_edit_unit", args=[unit.id]),
+                    self._unit_form_data(
+                        number=unit.number,
+                        unit_type=unit_type,
+                        description="Updated description",
+                    ),
+                )
+
+                self.assertEqual(response.status_code, 302)
+                unit.refresh_from_db()
+                self.assertEqual(unit.unit_type, unit_type)
+                self.assertEqual(unit.description, "Updated description")
+
+    def test_admin_create_unit_rejects_invalid_unit_type_without_coercion(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_create_unit"),
+            self._unit_form_data(number="UTINVALID", unit_type="LOFT"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("unit_type", response.context["form"].errors)
+        self.assertFalse(Unit.objects.filter(number="UTINVALID").exists())
+
+
+class TenantCreationEmailTests(TestCase):
+    def test_tenant_form_sends_credentials_immediately_after_creation(self):
+        admin = User.objects.create_superuser(
+            email="admin-create-tenant@gmail.com",
+            username="admincreatetenant",
+            password="password123",
+        )
+        form = TenantProfileForm(
+            data={
+                "email": "instant.tenant@gmail.com",
+                "first_name": "Instant",
+                "last_name": "Tenant",
+                "contact_no": "09170000000",
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+        with patch("accounts.admin_portal_forms.send_tenant_credentials_email", return_value=True) as send_email:
+            profile = form.save(uploaded_by=admin)
+
+        send_email.assert_called_once_with(
+            tenant_email="instant.tenant@gmail.com",
+            tenant_name="Instant Tenant",
+            password="ITenant",
+        )
+        self.assertTrue(profile.credentials_email_sent)
+        self.assertTrue(profile.user.check_password("ITenant"))
+
+
+class TenantCreationLocalStorageTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="local-tenant-admin@example.test",
+            username="localtenantadmin",
+            password="password123",
+        )
+        Unit.objects.create(number="TC-101")
+        self.client.force_login(self.admin)
+        self.media_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.media_dir.cleanup)
+        self.settings_override = override_settings(
+            UPLOAD_STORAGE_BACKEND="filesystem",
+            MEDIA_ROOT=Path(self.media_dir.name),
+            MEDIA_URL="/media/",
+            IS_PRODUCTION=False,
+        )
+        self.settings_override.enable()
+        self.addCleanup(self.settings_override.disable)
+
+    def _tenant_data(self, email):
+        return {
+            "email": email,
+            "first_name": "Local",
+            "last_name": "Tenant",
+            "contact_no": "09170000000",
+        }
+
+    def test_create_tenant_without_attachment_uses_no_external_storage(self):
+        with patch("accounts.admin_portal_forms.send_tenant_credentials_email", return_value=False), patch.object(
+            SupabaseStorage,
+            "client",
+            new_callable=PropertyMock,
+            side_effect=AssertionError("Local tenant creation must not initialize Supabase."),
+        ) as supabase_client:
+            response = self.client.post(
+                reverse("admin_create_tenant_profile"),
+                self._tenant_data("local-no-file@example.test"),
+            )
+
+        self.assertEqual(response.status_code, 302)
+        profile = TenantProfile.objects.get(user__email="local-no-file@example.test")
+        self.assertEqual(profile.user.role, User.Role.TENANT)
+        supabase_client.assert_not_called()
+
+    def test_create_tenant_with_contract_and_id_saves_both_attachments_locally(self):
+        data = self._tenant_data("local-with-files@example.test")
+        files = {
+            "contract_file": SimpleUploadedFile(
+                "contract.pdf", b"%PDF-1.4 local contract", content_type="application/pdf"
+            ),
+            "valid_id_file": SimpleUploadedFile(
+                "valid-id.pdf", b"%PDF-1.4 local id", content_type="application/pdf"
+            ),
+        }
+        data.update(files)
+
+        with patch("accounts.admin_portal_forms.send_tenant_credentials_email", return_value=False), patch.object(
+            SupabaseStorage,
+            "client",
+            new_callable=PropertyMock,
+            side_effect=AssertionError("Local tenant uploads must not initialize Supabase."),
+        ) as supabase_client:
+            response = self.client.post(reverse("admin_create_tenant_profile"), data)
+
+        self.assertEqual(response.status_code, 302)
+        profile = TenantProfile.objects.get(user__email="local-with-files@example.test")
+        attachments = list(TenantAttachment.objects.filter(tenant=profile.user).order_by("attachment_type"))
+        self.assertEqual({attachment.attachment_type for attachment in attachments}, {"CONTRACT", "VALID_ID"})
+        self.assertEqual(len(attachments), 2)
+        for attachment in attachments:
+            with self.subTest(attachment_type=attachment.attachment_type):
+                self.assertTrue(attachment.file.name.startswith("tenant_attachments/"))
+                self.assertTrue(attachment.file.path.startswith(self.media_dir.name))
+                self.assertTrue(attachment.file.url.startswith("/media/tenant_attachments/"))
+                with attachment.file.open("rb") as saved_file:
+                    self.assertTrue(saved_file.read().startswith(b"%PDF-1.4"))
+
+        profile.password_change_required = False
+        profile.save(update_fields=["password_change_required"])
+        self.client.force_login(profile.user)
+        owned_response = self.client.get(reverse("account_profile_attachment", args=[attachments[0].id]))
+        self.assertEqual(owned_response.status_code, 200)
+        self.assertTrue(b"%PDF-1.4" in b"".join(owned_response.streaming_content))
+
+        other_tenant = User.objects.create_user(
+            email="local-other-tenant@example.test",
+            username="localothertenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.client.force_login(other_tenant)
+        blocked_response = self.client.get(reverse("account_profile_attachment", args=[attachments[0].id]))
+        self.assertEqual(blocked_response.status_code, 404)
+
+        supabase_client.assert_not_called()
+
+    def test_invalid_tenant_upload_renders_field_error_without_creating_or_storing_file(self):
+        data = self._tenant_data("invalid-upload@example.test")
+        data["contract_description"] = "Lease document"
+        data["contract_file"] = SimpleUploadedFile(
+            "contract.exe", b"MZ fake executable", content_type="application/octet-stream"
+        )
+
+        with patch.object(
+            SupabaseStorage,
+            "client",
+            new_callable=PropertyMock,
+            side_effect=AssertionError("Invalid uploads must be rejected before storage."),
+        ) as supabase_client:
+            response = self.client.post(reverse("admin_create_tenant_profile"), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "admin_portal/tenant_form.html")
+        self.assertContains(
+            response,
+            "Invalid file type. Please upload a PDF, Word document (.doc/.docx), PNG, or JPG/JPEG file.",
+        )
+        self.assertContains(response, 'id="contract_file_error"')
+        self.assertContains(response, 'aria-live="polite"')
+        self.assertContains(response, "invalid-upload@example.test")
+        self.assertContains(response, 'value="Lease document"')
+        self.assertFalse(User.objects.filter(email="invalid-upload@example.test").exists())
+        self.assertFalse(TenantAttachment.objects.filter(file__contains="contract.exe").exists())
+        self.assertEqual(list(Path(self.media_dir.name).rglob("*")), [])
+        supabase_client.assert_not_called()
+
+class TenantProfileFormValidationTests(TestCase):
+    def test_tenant_form_blocks_duplicate_email_case_insensitively(self):
+        User.objects.create_user(
+            email="duplicate.base@gmail.com",
+            username="duplicatebase",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        form = TenantProfileForm(
+            data={
+                "email": "Duplicate.Base@GMAIL.com",
+                "first_name": "Duplicate",
+                "last_name": "Tenant",
+                "contact_no": "09170000000",
+            }
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("email", form.errors)
+
+    def test_tenant_form_blocks_gmail_plus_alias(self):
+        form = TenantProfileForm(
+            data={
+                "email": "johnarvint999+2@gmail.com",
+                "first_name": "John",
+                "last_name": "Alias",
+                "contact_no": "09170000000",
+            }
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("email", form.errors)
+        self.assertIn("without a '+' alias", form.errors["email"][0])
+
+    def test_tenant_form_blocks_numbers_in_first_name(self):
+        form = TenantProfileForm(
+            data={
+                "email": "valid.tenant@gmail.com",
+                "first_name": "John123",
+                "last_name": "Alias",
+                "contact_no": "09170000000",
+            }
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("first_name", form.errors)
+
+    def test_tenant_form_blocks_invalid_contact_number_characters(self):
+        form = TenantProfileForm(
+            data={
+                "email": "valid.tenant@gmail.com",
+                "first_name": "John",
+                "last_name": "Alias",
+                "contact_no": "0917-ABC-000",
+            }
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("contact_no", form.errors)
+
+
+class TenantEmailConstraintTests(TestCase):
+    def test_user_save_blocks_gmail_plus_alias(self):
+        with self.assertRaisesMessage(ValidationError, "Please use the main Gmail address without a '+' alias."):
+            User.objects.create_user(
+                email="johnarvint999+2@gmail.com",
+                username="johnplusalias",
+                password="password123",
+                role=User.Role.TENANT,
+            )
+
+    def test_edit_form_blocks_canonical_duplicate_email(self):
+        existing = User.objects.create_user(
+            email="johnarvint999@gmail.com",
+            username="existingjohn",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(user=existing, first_name="Existing", last_name="John")
+
+        editable = User.objects.create_user(
+            email="other.person@gmail.com",
+            username="otherperson",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        editable_profile = TenantProfile.objects.create(
+            user=editable,
+            first_name="Other",
+            last_name="Person",
+        )
+
+        form = ComprehensiveTenantEditForm(
+            editable_profile,
+            data={
+                "email": "JohnArvint999@Gmail.com",
+                "username": editable.username,
+                "role": editable.role,
+                "is_active": "on",
+                "first_name": editable_profile.first_name,
+                "last_name": editable_profile.last_name,
+                "contact_no": editable_profile.contact_no,
+                "new_password": "",
+                "confirm_password": "",
+            },
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("email", form.errors)
+
+    def test_edit_form_blocks_numbers_in_last_name(self):
+        editable = User.objects.create_user(
+            email="edit.person@gmail.com",
+            username="editperson",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        editable_profile = TenantProfile.objects.create(
+            user=editable,
+            first_name="Edit",
+            last_name="Person",
+            contact_no="09170000000",
+        )
+
+        form = ComprehensiveTenantEditForm(
+            editable_profile,
+            data={
+                "email": editable.email,
+                "username": editable.username,
+                "role": editable.role,
+                "is_active": "on",
+                "first_name": "Edit",
+                "last_name": "Person9",
+                "contact_no": "09170000000",
+                "new_password": "",
+                "confirm_password": "",
+            },
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("last_name", form.errors)
+
+    def test_edit_form_blocks_too_short_contact_number(self):
+        editable = User.objects.create_user(
+            email="short.contact@gmail.com",
+            username="shortcontact",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        editable_profile = TenantProfile.objects.create(
+            user=editable,
+            first_name="Short",
+            last_name="Contact",
+            contact_no="09170000000",
+        )
+
+        form = ComprehensiveTenantEditForm(
+            editable_profile,
+            data={
+                "email": editable.email,
+                "username": editable.username,
+                "role": editable.role,
+                "is_active": "on",
+                "first_name": "Short",
+                "last_name": "Contact",
+                "contact_no": "12345",
+                "new_password": "",
+                "confirm_password": "",
+            },
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("contact_no", form.errors)
+
+
+class AdminCashMoveInNotificationTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="admin-cash@gmail.com",
+            username="admincash",
+            password="password123",
+        )
+        self.tenant = User.objects.create_user(
+            email="john.constantine@gmail.com",
+            username="johncash",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="John",
+            last_name="Constantine",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(
+            number="C-700",
+            monthly_rent=Decimal("10000.00"),
+            status="AVAILABLE",
+        )
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            security_deposit=Decimal("20000.00"),
+            status=Lease.STATUS_PENDING_PAYMENT,
+            is_active=False,
+        )
+
+    def test_gcash_move_in_redirect_is_blocked(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/leases/{self.lease.id}/payment/",
+            {
+                "payment_method": "GCASH",
+            },
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "GCash QR is no longer available for move-in payments")
+        self.assertContains(response, "Select Payment Method")
+
+    def test_cash_move_in_activation_creates_admin_notification_for_tenant(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/leases/{self.lease.id}/payment/",
+            {
+                "payment_method": "CASH",
+                "admin_password": "password123",
+            },
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        notification = Notification.objects.filter(
+            title="Move-in payment received",
+            related_tenant=self.tenant,
+            recipient_type="ADMIN",
+        ).latest("created_at")
+        self.assertIn("John Constantine", notification.message)
+        self.assertIn("was successfully received as a cash payment.", notification.message)
+        self.assertIn("Lease activated", notification.message)
+        self.assertIn("First month's bill is paid.", notification.message)
+        self.assertIn("Payment reference:", notification.message)
+        self.assertNotIn("admin-cash@gmail.com", notification.message)
+
+    def test_new_lease_keeps_unit_available_until_move_in_payment(self):
+        self.client.force_login(self.admin)
+        tenant = User.objects.create_user(
+            email="pending-create@gmail.com",
+            username="pendingcreate",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=tenant,
+            first_name="Pending",
+            last_name="Create",
+            password_change_required=False,
+            created_by=None,
+        )
+        unit = Unit.objects.create(
+            number="C-701",
+            monthly_rent=Decimal("10000.00"),
+            status="AVAILABLE",
+        )
+
+        response = self.client.post(
+            "/admin-portal/leases/add/",
+            {
+                "tenant": tenant.id,
+                "unit": unit.id,
+                "monthly_rent": "10000.00",
+                "due_day": "1",
+                "start_date": "2026-06-01",
+                "end_date": "2027-06-01",
+                "security_deposit": "20000.00",
+                "motorcycle_slots": "0",
+                "car_slots": "0",
+            },
+        )
+
+        unit.refresh_from_db()
+        lease = Lease.objects.get(tenant=tenant, unit=unit)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(lease.status, Lease.STATUS_PENDING_PAYMENT)
+        self.assertFalse(lease.is_active)
+        self.assertEqual(unit.status, "AVAILABLE")
+
+    def test_admin_can_cancel_pending_lease_from_unit_context(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/leases/{self.lease.id}/delete/?next=unit",
+            {"admin_password": "password123"},
+        )
+
+        self.unit.refresh_from_db()
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], f"/admin-portal/units/{self.unit.id}/")
+        self.assertFalse(Lease.objects.filter(pk=self.lease.pk).exists())
+        self.assertEqual(self.unit.status, "AVAILABLE")
+
+    def test_pending_lease_detail_pages_show_cancel_action(self):
+        self.client.force_login(self.admin)
+
+        unit_response = self.client.get(f"/admin-portal/units/{self.unit.id}/")
+        payment_response = self.client.get(f"/admin-portal/leases/{self.lease.id}/payment/")
+
+        self.assertEqual(unit_response.status_code, 200)
+        self.assertEqual(payment_response.status_code, 200)
+        self.assertContains(unit_response, "Cancel Pending Lease")
+        self.assertContains(payment_response, "Cancel Pending Lease")
+
+
+class AdminTenantDeleteArchiveTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="admin-delete@gmail.com",
+            username="admindelete",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.tenant = User.objects.create_user(
+            email="archive.tenant@gmail.com",
+            username="archivetenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.profile = TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Archive",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(
+            number="A-245",
+            monthly_rent=Decimal("10000.00"),
+            status="OCCUPIED",
+        )
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-ARCHIVE-1",
+            payment_method="CASH",
+            payment_type="full",
+            amount=Decimal("10000.00"),
+            status="APPROVED",
+        )
+        MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Archive Test Request",
+            description="Leaking faucet",
+        )
+
+    def test_archive_tenant_serializes_record_snapshot_dates(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/tenants/{self.profile.id}/delete/",
+            {
+                "phase": "2",
+                "admin_password": "password123",
+                "deletion_type": "ARCHIVE",
+                "deletion_reason": "Regression test",
+            },
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        archive = ArchivedTenant.objects.get(original_tenant_id=self.profile.id)
+        summary = archive.tenant_data["records_summary"]
+        self.assertIsInstance(summary["leases"][0]["start_date"], str)
+        self.assertIsInstance(summary["payments_sample"][0]["created_at"], str)
+        self.assertIsInstance(summary["maintenance_sample"][0]["created_at"], str)
+
+    def test_delete_page_resolves_tenant_by_user_id_for_backward_compatibility(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get(f"/admin-portal/tenants/{self.tenant.id}/delete/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Security Verification Required")
+        self.assertContains(response, self.profile.full_name)
+
+
+    def test_delete_phase_two_disables_soft_and_hard_delete_for_tenants_with_records(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/tenants/{self.profile.id}/delete/",
+            {"admin_password": "password123"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'value="SOFT_DELETE"')
+        self.assertContains(response, 'value="HARD_DELETE"')
+        self.assertContains(response, 'disabled')
+        self.assertContains(response, 'already has records')
+
+    def test_soft_delete_removes_empty_tenant_with_restorable_archive(self):
+        empty_tenant = User.objects.create_user(
+            email="empty.tenant@gmail.com",
+            username="emptytenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        empty_profile = TenantProfile.objects.create(
+            user=empty_tenant,
+            first_name="Empty",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/tenants/{empty_profile.id}/delete/",
+            {
+                "phase": "2",
+                "admin_password": "password123",
+                "deletion_type": "SOFT_DELETE",
+                "deletion_reason": "Cleanup test",
+            },
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(TenantProfile.objects.filter(pk=empty_profile.id).exists())
+        self.assertFalse(User.objects.filter(pk=empty_tenant.id).exists())
+        archive = ArchivedTenant.objects.get(email="empty.tenant@gmail.com")
+        self.assertEqual(archive.archive_type, "DELETED_SOFT")
+        self.assertTrue(archive.can_be_restored)
+
+    def test_hard_delete_is_blocked_for_tenant_with_records(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/tenants/{self.profile.id}/delete/",
+            {
+                "phase": "2",
+                "admin_password": "password123",
+                "deletion_type": "HARD_DELETE",
+                "deletion_reason": "Unsafe delete attempt",
+            },
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(TenantProfile.objects.filter(pk=self.profile.id).exists())
+        self.assertTrue(User.objects.filter(pk=self.tenant.id).exists())
+        self.assertContains(response, 'Hard delete is blocked')
+
+    def test_hard_delete_removes_empty_tenant_with_non_restorable_archive(self):
+        empty_tenant = User.objects.create_user(
+            email="hard.empty@gmail.com",
+            username="hardempty",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        empty_profile = TenantProfile.objects.create(
+            user=empty_tenant,
+            first_name="Hard",
+            last_name="Empty",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            f"/admin-portal/tenants/{empty_profile.id}/delete/",
+            {
+                "phase": "2",
+                "admin_password": "password123",
+                "deletion_type": "HARD_DELETE",
+                "deletion_reason": "Permanent cleanup",
+            },
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(TenantProfile.objects.filter(pk=empty_profile.id).exists())
+        self.assertFalse(User.objects.filter(pk=empty_tenant.id).exists())
+        archive = ArchivedTenant.objects.get(email="hard.empty@gmail.com")
+        self.assertEqual(archive.archive_type, "DELETED_HARD")
+        self.assertFalse(archive.can_be_restored)
+
+
+class LeaseFormCompatibilityTests(TestCase):
+    def test_lease_form_save_populates_legacy_renewal_status(self):
+        tenant = User.objects.create_user(
+            email="lease.compat@gmail.com",
+            username="leasecompat",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=tenant,
+            first_name="Lease",
+            last_name="Compat",
+            password_change_required=False,
+            created_by=None,
+        )
+        unit = Unit.objects.create(
+            number="LC-101",
+            monthly_rent=Decimal("12000.00"),
+            status="AVAILABLE",
+        )
+
+        form = LeaseForm(
+            data={
+                "tenant": tenant.id,
+                "unit": unit.id,
+                "monthly_rent": "12000.00",
+                "due_day": "27",
+                "start_date": "2026-06-27",
+                "end_date": "2027-06-27",
+                "security_deposit": "24000.00",
+                "motorcycle_slots": "0",
+                "car_slots": "0",
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+        lease = form.save()
+
+        self.assertEqual(lease.status, Lease.STATUS_PENDING_PAYMENT)
+        self.assertEqual(lease.renewal_status, "")
+
+class StaffManagementMVPTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="staff-mgmt-admin@gmail.com",
+            username="staffmgmtadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="staff-mgmt-active@gmail.com",
+            username="staffmgmtactive",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.inactive_staff = User.objects.create_user(
+            email="staff-mgmt-inactive@gmail.com",
+            username="staffmgmtinactive",
+            password="password123",
+            role=User.Role.STAFF,
+            is_active=False,
+        )
+        TenantProfile.objects.create(user=self.staff, first_name="Active", last_name="Worker", created_by=self.admin)
+        TenantProfile.objects.create(user=self.inactive_staff, first_name="Inactive", last_name="Worker", created_by=self.admin)
+
+    def test_admin_can_create_staff_account_from_staff_management(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_staff_add"),
+            {
+                "full_name": "Maria Santos",
+                "email": "new-staff@example.com",
+                "contact_no": "09170000011",
+                "temporary_password": "TempPass123!",
+                "confirm_password": "TempPass123!",
+                "status": "ACTIVE",
+            },
+        )
+
+        self.assertRedirects(response, reverse("admin_staff_management"))
+        new_staff = User.objects.get(email="new-staff@example.com")
+        self.assertEqual(new_staff.role, User.Role.STAFF)
+        self.assertTrue(new_staff.is_active)
+        self.assertTrue(new_staff.check_password("TempPass123!"))
+        self.assertTrue(
+            TenantProfile.objects.filter(
+                user=new_staff,
+                first_name="Maria",
+                last_name="Santos",
+                contact_no="09170000011",
+            ).exists()
+        )
+
+    def test_staff_user_cannot_access_admin_staff_management_routes(self):
+        self.client.force_login(self.staff)
+
+        response = self.client.get(reverse("admin_staff_management"))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response.url)
+
+    def test_admin_can_activate_inactive_staff_from_management(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_staff_toggle_status", args=[self.inactive_staff.id]),
+            {"action": "activate"},
+        )
+
+        self.assertRedirects(response, reverse("admin_staff_management"))
+        self.inactive_staff.refresh_from_db()
+        self.assertTrue(self.inactive_staff.is_active)
+
+    def test_inactive_staff_cannot_log_in_after_deactivation(self):
+        self.client.force_login(self.admin)
+        deactivate_response = self.client.post(
+            reverse("admin_staff_toggle_status", args=[self.staff.id]),
+            {"action": "deactivate"},
+        )
+        self.assertRedirects(deactivate_response, reverse("admin_staff_management"))
+
+        self.staff.refresh_from_db()
+        self.assertFalse(self.staff.is_active)
+
+        self.client.logout()
+        login_response = self.client.post(
+            reverse("login"),
+            {"username": self.staff.email, "password": "password123"},
+        )
+
+        self.assertEqual(login_response.status_code, 200)
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_staff_add_form_renders_visible_admin_input_classes(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_staff_add"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'name="full_name"')
+        self.assertContains(response, 'name="email"')
+        self.assertContains(response, 'name="contact_no"')
+        self.assertContains(response, 'name="temporary_password"')
+        self.assertContains(response, 'name="confirm_password"')
+        self.assertContains(response, 'w-full px-4 py-3.5 bg-slate-50 border-2 border-slate-100 rounded-xl')
+        self.assertContains(response, 'grid grid-cols-1 gap-6 lg:grid-cols-[1.4fr_0.8fr]')
+
+    def test_staff_edit_form_uses_same_field_styling(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_staff_edit", args=[self.staff.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'name="full_name"')
+        self.assertContains(response, 'name="email"')
+        self.assertContains(response, 'name="contact_no"')
+        self.assertContains(response, 'name="new_password"')
+        self.assertContains(response, 'name="confirm_new_password"')
+        self.assertContains(response, 'appearance-none shadow-sm')
+        self.assertContains(response, 'Leave blank to keep the current password.')
+
+    def test_staff_add_form_shows_field_and_password_validation_errors(self):
+        self.client.force_login(self.admin)
+
+        empty_response = self.client.post(reverse("admin_staff_add"), {})
+        self.assertEqual(empty_response.status_code, 200)
+        self.assertContains(empty_response, 'This field is required.', count=5)
+
+        mismatch_response = self.client.post(
+            reverse("admin_staff_add"),
+            {
+                "full_name": "Maria Santos",
+                "email": "mismatch-staff@example.com",
+                "contact_no": "09170000011",
+                "temporary_password": "TempPass123!",
+                "confirm_password": "TempPass456!",
+                "status": "ACTIVE",
+            },
+        )
+
+        self.assertEqual(mismatch_response.status_code, 200)
+        self.assertContains(mismatch_response, 'Temporary passwords do not match.')
+
+    def test_admin_can_change_staff_password_from_edit_page(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_staff_edit", args=[self.staff.id]),
+            {
+                "full_name": "Active Worker",
+                "email": self.staff.email,
+                "contact_no": "09170000022",
+                "new_password": "UpdatedPass123!",
+                "confirm_new_password": "UpdatedPass123!",
+                "status": "ACTIVE",
+            },
+        )
+
+        self.assertRedirects(response, reverse("admin_staff_management"))
+        self.staff.refresh_from_db()
+        self.assertTrue(self.staff.check_password("UpdatedPass123!"))
+        self.assertEqual(self.staff.tenantprofile.contact_no, "09170000022")
+
+    def test_staff_edit_form_shows_password_mismatch_validation_error(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_staff_edit", args=[self.staff.id]),
+            {
+                "full_name": "Active Worker",
+                "email": self.staff.email,
+                "contact_no": "09170000022",
+                "new_password": "UpdatedPass123!",
+                "confirm_new_password": "MismatchPass123!",
+                "status": "ACTIVE",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'New passwords do not match.')
+
+
+class PublicSeoEndpointTests(TestCase):
+    homepage_title = "RealEstate360+ | Property Management System in the Philippines"
+    homepage_description = (
+        "RealEstate360+ is a property management system for rentals, tenants, billing, payments, "
+        "maintenance, and property operations in the Philippines."
+    )
+
+    def test_homepage_uses_requested_title_description_h1_and_canonical(self):
+        response = self.client.get(reverse("public_home"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, f"<title>{self.homepage_title}</title>")
+        self.assertEqual(response.content.count(b"<title>"), 1)
+        self.assertContains(
+            response,
+            f'<meta name="description" content="{self.homepage_description}">',
+        )
+        self.assertEqual(response.content.count(b'<meta name="description"'), 1)
+        self.assertContains(response, "RealEstate360+ <i>Property Management, Simplified</i>")
+        self.assertContains(response, '<link rel="canonical" href="https://realestate360.site/">')
+        self.assertEqual(response.content.count(b'rel="canonical"'), 1)
+        self.assertNotContains(response, "noindex")
+
+    def test_admin_page_metadata_is_not_replaced_with_homepage_metadata(self):
+        admin_user = User.objects.create_superuser(
+            email="seo-admin@example.com",
+            username="seoadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.client.force_login(admin_user)
+
+        response = self.client.get(reverse("admin_dashboard"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "<title>Home | RealEstate360+</title>")
+        self.assertNotContains(response, self.homepage_title)
+        self.assertNotContains(response, self.homepage_description)
+
+    def test_public_homepage_uses_dedicated_favicon(self):
+        response = self.client.get(reverse("public_home"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            '<link rel="icon" href="/static/img/favicon.svg" type="image/svg+xml">',
+        )
+
+    def test_favicon_asset_is_square_svg(self):
+        from xml.etree import ElementTree
+
+        favicon_path = Path(__file__).resolve().parent.parent / "static" / "img" / "favicon.svg"
+        root = ElementTree.parse(favicon_path).getroot()
+
+        self.assertEqual(root.attrib["viewBox"], "0 0 512 512")
+
+    def test_sitemap_is_valid_xml_with_only_the_public_landing_page(self):
+        from xml.etree import ElementTree
+
+        response = self.client.get(reverse("sitemap"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("xml", response["Content-Type"])
+        root = ElementTree.fromstring(response.content)
+        self.assertEqual(root.tag, "{http://www.sitemaps.org/schemas/sitemap/0.9}urlset")
+        self.assertEqual(reverse("public_home"), "/")
+        self.assertIn(b"https://realestate360.site/", response.content)
+        self.assertNotIn(b"https://realestate360.site/login/", response.content)
+        self.assertNotIn(b"/admin-portal/", response.content)
+        self.assertNotIn(b"/tenant/", response.content)
+        self.assertNotIn(b"/payments/", response.content)
+        self.assertNotIn(b"/maintenance/", response.content)
+
+    def test_robots_txt_points_to_canonical_sitemap_and_disallows_private_areas(self):
+        response = self.client.get(reverse("robots_txt"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/plain", response["Content-Type"])
+        self.assertContains(response, "User-agent: *")
+        self.assertContains(response, "Allow: /")
+        self.assertContains(response, "Disallow: /admin/")
+        self.assertContains(response, "Disallow: /admin-portal/")
+        self.assertContains(response, "Disallow: /tenant/")
+        self.assertContains(response, "Disallow: /payments/")
+        self.assertContains(response, "Disallow: /maintenance/")
+        self.assertContains(response, "Disallow: /water/")
+        self.assertContains(response, "Sitemap: https://realestate360.site/sitemap.xml")
+        self.assertNotContains(response, "railway.app")

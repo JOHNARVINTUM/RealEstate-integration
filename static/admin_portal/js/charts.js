@@ -1,0 +1,1 @@
+/* Charts are rendered inline in dashboard.html using live data from the view. */

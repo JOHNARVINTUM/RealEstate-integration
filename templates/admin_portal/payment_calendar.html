@@ -1,0 +1,22 @@
+{% extends "admin_portal/base.html" %}
+{% block title %}F2F Cash Calendar | Real Estate Administration{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto px-2 sm:px-4 lg:px-6 py-4 sm:py-6 pb-12 space-y-6 text-slate-900">
+  <header class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+    <div>
+      <p class="text-xs font-black uppercase tracking-wide text-amber-700">F2F Cash Schedule</p>
+      <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight text-slate-900 leading-tight mt-1">Weekly Payment Calendar</h1>
+      <p class="text-sm text-slate-700 mt-1 leading-relaxed">Use the calendar to inspect scheduled cash appointments by week.</p>
+    </div>
+    <a href="{% url 'admin_payments' %}?status=PENDING&method=CASH" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-xs group">
+      <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+      </svg>
+      <span>Back</span>
+    </a>
+  </header>
+
+  {% include "admin_portal/payment_calendar_section.html" %}
+</div>
+{% endblock %}

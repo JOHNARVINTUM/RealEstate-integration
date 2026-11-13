@@ -1,0 +1,291 @@
+{% load humanize %}
+{% load l10n %}
+
+<div class="lease-schedule-preview h-full" id="lease-schedule-preview" data-existing-lease="{% if lease %}true{% else %}false{% endif %}" style="display: none;">
+    <div class="bg-white border border-slate-200 rounded-xl shadow-xs overflow-hidden flex flex-col h-full sticky top-6">
+        
+        <!-- Ledger Schedule Header -->
+        <div class="p-5 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+            <div>
+                <span class="text-[10px] font-extrabold uppercase tracking-wider text-slate-500 block">Projection Schedule</span>
+                <h5 class="text-base font-extrabold text-slate-900 tracking-tight mt-0.5">Live Accounting Ledger</h5>
+            </div>
+            <span class="px-2 py-0.5 rounded bg-slate-200 text-slate-700 text-[10px] font-bold" id="contract-scope-label">Contract Scope</span>
+        </div>
+
+        <div class="p-5 space-y-6 flex-1 overflow-y-auto custom-scrollbar">
+            
+            {% if not lease %}
+            <!-- Move-in Cost Focus Box -->
+            <div class="bg-slate-50 rounded-lg p-4 border border-slate-200">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-bold text-slate-700">Total Settlement Due</span>
+                    <strong class="text-xl font-black text-slate-900" data-preview="total_move_in_cost">₱0.00</strong>
+                </div>
+                <div class="space-y-2 pt-2 border-t border-slate-200/60 text-xs">
+                    <div class="flex justify-between text-slate-600">
+                        <span>1st Month Rent</span>
+                        <strong class="text-slate-900" data-preview="monthly_rent">₱0.00</strong>
+                    </div>
+                    <div class="flex justify-between text-slate-600">
+                        <span>Security Deposit (2× rent)</span>
+                        <strong class="text-slate-900" data-preview="security_deposit">₱0.00</strong>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- Milestone Details -->
+            <div class="space-y-2.5">
+                <span class="text-xs font-extrabold uppercase tracking-wider text-slate-500 block">Key Action Milestones</span>
+                <div class="grid grid-cols-2 gap-3 text-xs">
+                    <div class="p-3 bg-white border border-slate-200 rounded-lg shadow-2xs">
+                        <span class="text-[10px] font-bold text-amber-700 block mb-0.5">{% if lease %}Lease Start{% else %}Move-in Date Target{% endif %}</span>
+                        <strong class="text-sm font-black text-slate-900 block" id="milestone-security">{% if lease %}—{% else %}₱0.00{% endif %}</strong>
+                        <span class="text-[10px] text-slate-500 block mt-1">Commences: <strong class="text-slate-700" id="milestone-movein-date">—</strong></span>
+                    </div>
+                    <div class="p-3 bg-white border border-slate-200 rounded-lg shadow-2xs">
+                        <span class="text-[10px] font-bold text-blue-700 block mb-0.5">{% if lease %}Regular Monthly Cycle{% else %}First Regular Cycle{% endif %}</span>
+                        <strong class="text-sm font-black text-slate-900 block" id="milestone-first-rent">₱0.00</strong>
+                        <span class="text-[10px] text-slate-500 block mt-1">Target: <strong class="text-slate-700" id="milestone-first-rent-date">—</strong></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Contract Projection Table -->
+            <div class="space-y-2">
+                <span class="text-xs font-extrabold uppercase tracking-wider text-slate-500 block">Contract Billing Trajectory</span>
+                <div class="border border-slate-200 rounded-lg overflow-hidden">
+                    <table class="w-full text-left text-xs" id="monthly-schedule-table">
+                        <thead class="bg-slate-100 text-slate-700 font-bold border-b border-slate-200 text-[11px]">
+                            <tr>
+                                <th class="px-3 py-2">Cycle</th>
+                                <th class="px-3 py-2">Due Date</th>
+                                <th class="px-3 py-2 text-right">Amount</th>
+                            </tr>
+                        </thead>
+                        <tbody id="monthly-schedule-body" class="text-slate-800 divide-y divide-slate-100">
+                            <!-- Dynamically populated by form JS -->
+                        </tbody>
+                        <tfoot class="bg-slate-50 border-t border-slate-200">
+                            <tr class="font-extrabold text-slate-900">
+                                <td colspan="2" class="px-3 py-2.5 text-xs text-slate-700">Calculated Contract Value</td>
+                                <td class="px-3 py-2.5 text-right text-sm text-slate-900" id="total-contract-months">₱0.00</td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- QR Instructions Box (Dynamic conditional display) -->
+        <div id="preview-gcash-footer" class="p-4 bg-slate-50 border-t border-slate-200" style="display: none;">
+            <div class="flex items-center gap-3">
+                <div class="bg-white p-1 rounded border border-slate-300 shrink-0">
+                    <img src="/static/img/gcash_qr3.jpg" class="w-12 h-12 object-contain" alt="QR Reference">
+                </div>
+                <div class="text-xs">
+                    <strong class="font-bold text-slate-900 block">Scan to Transfer Remittance</strong>
+                    <span class="text-slate-600 block text-[11px] leading-tight mt-0.5">Settle initial move-in metrics directly via GCash instrument code.</span>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const form = document.querySelector('form');
+    const previewContainer = document.getElementById('lease-schedule-preview');
+    const monthlyScheduleBody = document.getElementById('monthly-schedule-body');
+    const gcashPreviewFooter = document.getElementById('preview-gcash-footer');
+    const isExistingLease = previewContainer?.dataset.existingLease === 'true';
+    
+    if (form && previewContainer) {
+        const fields = ['id_monthly_rent', 'id_security_deposit', 'id_start_date', 'id_end_date', 'id_due_day', 'id_motorcycle_slots', 'id_car_slots'];
+        // Note: id_deposit_multiplier removed - using fixed 2x multiplier
+        
+        function formatCurrency(amount) {
+            return '₱' + amount.toLocaleString('en-PH', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        }
+        
+        function formatDate(date) {
+            return date.toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+
+        function parseLocalDate(value) {
+            if (!value) return null;
+            const parts = value.split('-').map(Number);
+            if (parts.length !== 3 || parts.some(Number.isNaN)) return null;
+            return new Date(parts[0], parts[1] - 1, parts[2]);
+        }
+        
+        function calculateDueDate(startDate, monthOffset, dueDay) {
+            const date = new Date(startDate);
+            date.setMonth(date.getMonth() + monthOffset);
+            const lastDayOfMonth = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+            date.setDate(Math.min(dueDay, lastDayOfMonth));
+            return date;
+        }
+
+        function contractCycleCount(startDate, endDate) {
+            if (!startDate || !endDate || isNaN(startDate.getTime()) || isNaN(endDate.getTime()) || endDate < startDate) {
+                return 0;
+            }
+            const monthDiff = (endDate.getFullYear() - startDate.getFullYear()) * 12
+                + (endDate.getMonth() - startDate.getMonth());
+            if (monthDiff >= 12) {
+                return 12;
+            }
+            return Math.max(monthDiff + 1, 1);
+        }
+        
+        function getVal(id, fallback) {
+            const el = document.getElementById(id);
+            return el ? el.value : String(fallback);
+        }
+
+        function syncDueDayWithStartDate() {
+            const startDateInput = getVal('id_start_date', '');
+            const dueDayField = document.getElementById('id_due_day');
+            if (!dueDayField) return;
+            if (!startDateInput) {
+                dueDayField.value = '';
+                return;
+            }
+            const parsed = new Date(startDateInput);
+            if (!isNaN(parsed.getTime())) {
+                dueDayField.value = parsed.getDate();
+            }
+        }
+
+        function updatePreview() {
+            const monthlyRent = parseFloat(getVal('id_monthly_rent', 0)) || 0;
+            const depositMultiplier = 2; // Fixed 2x multiplier
+            const startDateInput = getVal('id_start_date', '');
+            const endDateInput = getVal('id_end_date', '');
+            syncDueDayWithStartDate();
+            const dueDay = parseInt(getVal('id_due_day', 1)) || 1;
+            const motorcycleSlots = parseInt(getVal('id_motorcycle_slots', 0)) || 0;
+            const carSlots = parseInt(getVal('id_car_slots', 0)) || 0;
+            const parkingFee = (motorcycleSlots * 350) + (carSlots * 2500);
+            
+            // Calculate security deposit: (rent + parking) × 2 when there's parking
+            const baseForSecurityDeposit = monthlyRent + parkingFee;
+            const calculatedSecurityDeposit = baseForSecurityDeposit * depositMultiplier;
+            
+            // Use user-entered value if provided, otherwise auto-calculate
+            const rawSec = parseFloat(getVal('id_security_deposit', 0));
+            const securityDeposit = (!isNaN(rawSec) && rawSec > 0) ? rawSec : calculatedSecurityDeposit;
+            
+            // Toggle GCash footer in preview
+            const paymentMethod = document.querySelector('input[name="move_in_payment_method"]:checked')?.value;
+            if (gcashPreviewFooter) {
+                gcashPreviewFooter.style.display = (paymentMethod === 'GCASH') ? 'block' : 'none';
+            }
+
+            if (monthlyRent > 0 && startDateInput && endDateInput) {
+                const startDate = parseLocalDate(startDateInput);
+                const endDate = parseLocalDate(endDateInput);
+                const cycleCount = contractCycleCount(startDate, endDate);
+                if (!cycleCount) {
+                    previewContainer.style.display = 'none';
+                    return;
+                }
+
+                previewContainer.style.display = 'block';
+                const monthlyTotal = monthlyRent + parkingFee;
+                // Total move-in cost = 1st month rent + security deposit + parking
+                // Security deposit = (rent + parking) × 2
+                const totalMoveInCost = monthlyRent + securityDeposit + parkingFee;
+                
+                let parkingLabel = '';
+                if (motorcycleSlots > 0 && carSlots > 0) parkingLabel = ` + \u20b1${parkingFee.toLocaleString('en-PH')} parking (${motorcycleSlots} moto + ${carSlots} car)`;
+                else if (motorcycleSlots > 0) parkingLabel = ` + \u20b1${parkingFee.toLocaleString('en-PH')} parking (${motorcycleSlots} motorcycle${motorcycleSlots > 1 ? 's' : ''})`;
+                else if (carSlots > 0) parkingLabel = ` + \u20b1${parkingFee.toLocaleString('en-PH')} parking (${carSlots} car${carSlots > 1 ? 's' : ''})`;
+                function setPreview(key, val, useHtml) {
+                    const el = document.querySelector(`[data-preview="${key}"]`);
+                    if (!el) return;
+                    if (useHtml) el.innerHTML = val; else el.textContent = val;
+                }
+                setPreview('monthly_rent', formatCurrency(monthlyRent) + parkingLabel, true);
+                setPreview('security_deposit', formatCurrency(securityDeposit), false);
+                setPreview('total_move_in_cost', formatCurrency(totalMoveInCost), false);
+                
+                function setEl(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+                setEl('milestone-security', isExistingLease ? formatDate(startDate) : formatCurrency(totalMoveInCost));
+                setEl('milestone-movein-date', formatDate(startDate));
+                setEl('milestone-first-rent', formatCurrency(monthlyTotal));
+                const firstRentDueDate = calculateDueDate(startDate, 0, dueDay);
+                setEl('milestone-first-rent-date', formatDate(firstRentDueDate));
+                setEl('contract-scope-label', `${cycleCount} Cycle${cycleCount === 1 ? '' : 's'}`);
+                
+                let scheduleHTML = '';
+                let totalContractAmount = 0;
+                
+                for (let i = 0; i < cycleCount; i++) {
+                    const monthNumber = i + 1;
+                    const dueDate = calculateDueDate(startDate, i, dueDay);
+                    let amount = monthlyRent;
+                    let amountDisplay = '';
+                    
+                    if (i === 0 && !isExistingLease) {
+                        amount = totalMoveInCost;
+                        amountDisplay = `<span class="text-amber-700 font-extrabold">${formatCurrency(amount)}</span>`;
+                        totalContractAmount += amount;
+                    } else {
+                        amount = monthlyTotal;
+                        amountDisplay = parkingFee > 0
+                            ? `${formatCurrency(monthlyRent)} <span class="text-slate-500 text-[10px] font-bold">+\u20b1${parkingFee.toLocaleString('en-PH')} parking</span>`
+                            : formatCurrency(amount);
+                        totalContractAmount += amount;
+                    }
+                    
+                    scheduleHTML += `
+                        <tr class="hover:bg-slate-50 transition-colors">
+                            <td class="px-3 py-2 font-bold text-slate-700">Cycle ${monthNumber}</td>
+                            <td class="px-3 py-2 text-slate-600">${formatDate(dueDate)}</td>
+                            <td class="px-3 py-2 text-right font-medium text-slate-900">${amountDisplay}</td>
+                        </tr>
+                    `;
+                }
+                
+                if (monthlyScheduleBody) monthlyScheduleBody.innerHTML = scheduleHTML;
+                setEl('total-contract-months', formatCurrency(totalContractAmount));
+            } else {
+                previewContainer.style.display = 'none';
+            }
+        }
+        
+        fields.forEach(fieldId => {
+            const field = document.getElementById(fieldId);
+            if (field) {
+                field.addEventListener('change', updatePreview);
+                field.addEventListener('input', updatePreview);
+            }
+        });
+        
+        // Watch payment method for GCash footer
+        document.querySelectorAll('input[name="move_in_payment_method"]').forEach(radio => {
+            radio.addEventListener('change', updatePreview);
+        });
+
+        // Watch parking slot inputs
+        ['id_motorcycle_slots', 'id_car_slots'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) { el.addEventListener('input', updatePreview); el.addEventListener('change', updatePreview); }
+        });
+        
+        updatePreview();
+    }
+});
+</script>
+
+<style>
+.custom-scrollbar::-webkit-scrollbar { width: 5px; }
+.custom-scrollbar::-webkit-scrollbar-track { background: #f1f5f9; }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+.custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+</style>

@@ -1,0 +1,794 @@
+from datetime import date
+from decimal import Decimal
+import logging
+import mimetypes
+from types import SimpleNamespace
+
+from django.contrib import messages
+from django.core.paginator import Paginator
+from django.db.models import Count, Exists, OuterRef, Q
+from django.http import FileResponse, Http404
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.utils.http import url_has_allowed_host_and_scheme
+from django.utils import timezone
+from django.views.decorators.http import require_GET
+
+from billing.models import MonthlyBill
+from maintenance.models import MaintenanceRequest
+from payments.models import ManualPayment
+from rentals.models import Lease, LeaseContractEvent, Notification, TenantAttachment, TenantProfile, Unit
+from rentals.notification_copy import tenant_account_updated_notification_copy
+from rentals.services import TenantRiskService
+
+from .admin_portal_forms import ComprehensiveTenantEditForm, TenantProfileForm
+from .admin_portal_views import admin_password_verified, admin_required, render_admin_password_confirm
+
+
+logger = logging.getLogger(__name__)
+
+
+def _apply_tenant_search(queryset, query: str):
+    terms = [term for term in query.replace(",", " ").split() if term]
+    for term in terms:
+        queryset = queryset.filter(
+            Q(first_name__icontains=term)
+            | Q(last_name__icontains=term)
+            | Q(contact_no__icontains=term)
+            | Q(user__email__icontains=term)
+            | Q(user__username__icontains=term)
+        )
+    return queryset
+
+
+def _archive_json_safe(value):
+    if isinstance(value, dict):
+        return {key: _archive_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_archive_json_safe(item) for item in value]
+    if isinstance(value, Decimal):
+        return float(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def tenant_has_records(tenant):
+    """Check if tenant has any records that should prevent hard delete."""
+    user = tenant.user
+    return (
+        Lease.objects.filter(tenant=user).exists()
+        or ManualPayment.objects.filter(user=user).exists()
+        or MaintenanceRequest.objects.filter(tenant=user).exists()
+        or TenantAttachment.objects.filter(tenant=user).exists()
+    )
+
+
+def _get_tenant_profile_or_404(tenant_id: int, *, with_risk: bool = False):
+    related = ["user"]
+    if with_risk:
+        related.append("user__tenantriskclassification")
+    queryset = TenantProfile.objects.select_related(*related)
+    tenant = queryset.filter(pk=tenant_id).first()
+    if tenant:
+        return tenant
+    tenant = queryset.filter(user_id=tenant_id).first()
+    if tenant:
+        return tenant
+    raise Http404("No TenantProfile matches the given query.")
+
+
+def _tenant_display_lease(leases):
+    today = timezone.localdate()
+    for lease in leases:
+        if (
+            lease.status == Lease.STATUS_ACTIVE
+            and lease.start_date <= today
+            and (lease.end_date is None or lease.end_date >= today)
+        ):
+            return lease
+    return leases[0] if leases else None
+
+
+def _parse_payment_bill_ids(raw_bill_ids):
+    bill_ids = []
+    for value in (raw_bill_ids or "").split(","):
+        value = value.strip()
+        if value.isdigit():
+            bill_ids.append(int(value))
+    return bill_ids
+
+
+def _format_covered_months(bills):
+    if not bills:
+        return "-"
+    ordered = sorted(bills, key=lambda bill: bill.billing_month)
+    if len(ordered) == 1:
+        return ordered[0].billing_month.strftime("%b %Y")
+    return f"{ordered[0].billing_month.strftime('%b %Y')} - {ordered[-1].billing_month.strftime('%b %Y')}"
+
+
+def _monthly_bill_payment_method_summary(payments):
+    method_labels = []
+    has_paymongo = False
+
+    for payment in payments:
+        if payment.payment_method == "PAYMONGO":
+            has_paymongo = True
+            actual_method = (payment.paid_via or "").strip().lower()
+            if actual_method in {"", "unknown", "online"}:
+                label = "PayMongo"
+            else:
+                label = {
+                    "gcash": "GCash",
+                    "card": "Card",
+                    "grab_pay": "GrabPay",
+                }.get(actual_method, actual_method.replace("_", " ").title())
+        elif payment.payment_method == "GCASH":
+            label = "GCash"
+        elif payment.payment_method == "CASH":
+            label = "Cash"
+        else:
+            label = payment.get_payment_method_display() or ""
+
+        if label and label not in method_labels:
+            method_labels.append(label)
+
+    provider_label = ""
+    if has_paymongo and len(method_labels) == 1 and method_labels[0] != "PayMongo":
+        provider_label = "via PayMongo"
+    elif has_paymongo and len(method_labels) > 1:
+        provider_label = "Includes PayMongo"
+
+    return " + ".join(method_labels), provider_label
+
+
+def deactivate_tenant(tenant):
+    """Deactivate tenant: disable login, close active leases, free units."""
+    today = date.today()
+    user = tenant.user
+
+    user.is_active = False
+    user.save(update_fields=["is_active"])
+
+    active_leases = Lease.objects.select_related("unit").filter(tenant=user, status=Lease.STATUS_ACTIVE)
+    for lease in active_leases:
+        lease.deactivate(end_date=today)
+
+        unit = lease.unit
+        unit.status = "AVAILABLE"
+        unit.save(update_fields=["status"])
+
+
+@admin_required
+def admin_tenants(request):
+    q = request.GET.get("q", "").strip()
+    lease_filter = request.GET.get("lease", "").strip()
+
+    today = timezone.localdate()
+    tenants_list = TenantProfile.objects.select_related("user").annotate(
+        has_active_lease=Exists(
+            Lease.objects.filter(
+                tenant=OuterRef("user"),
+                status=Lease.STATUS_ACTIVE,
+                start_date__lte=today,
+            ).filter(Q(end_date__isnull=True) | Q(end_date__gte=today))
+        ),
+        has_pending_move_in=Exists(
+            Lease.objects.filter(
+                tenant=OuterRef("user"),
+                status=Lease.STATUS_PENDING_PAYMENT,
+            )
+        )
+    )
+    if q:
+        tenants_list = _apply_tenant_search(tenants_list, q)
+
+    if lease_filter == "active":
+        tenants_list = tenants_list.filter(has_active_lease=True)
+    elif lease_filter == "pending":
+        tenants_list = tenants_list.filter(has_pending_move_in=True)
+    elif lease_filter == "none":
+        tenants_list = tenants_list.filter(
+            has_active_lease=False,
+            has_pending_move_in=False,
+        )
+
+    tenants_list = tenants_list.order_by("first_name", "last_name")
+
+    paginator = Paginator(tenants_list, 10)
+    page_number = request.GET.get("page")
+    page_obj = paginator.get_page(page_number)
+
+    page_user_ids = [tenant.user_id for tenant in page_obj]
+    lease_user_ids = set(
+        Lease.objects.filter(tenant_id__in=page_user_ids).values_list("tenant_id", flat=True)
+    )
+    payment_user_ids = set(
+        ManualPayment.objects.filter(user_id__in=page_user_ids).values_list("user_id", flat=True)
+    )
+    maintenance_user_ids = set(
+        MaintenanceRequest.objects.filter(tenant_id__in=page_user_ids).values_list("tenant_id", flat=True)
+    )
+    attachment_user_ids = set(
+        TenantAttachment.objects.filter(tenant_id__in=page_user_ids).values_list("tenant_id", flat=True)
+    )
+
+    for tenant in page_obj:
+        tenant.has_records = tenant.user_id in (
+            lease_user_ids | payment_user_ids | maintenance_user_ids | attachment_user_ids
+        )
+
+    now = timezone.now()
+    tenant_counts = TenantProfile.objects.aggregate(
+        total=Count("id"),
+        new_this_month=Count(
+            "id",
+            filter=Q(user__date_joined__year=now.year, user__date_joined__month=now.month),
+        ),
+    )
+    total_tenants_count = tenant_counts["total"]
+    new_tenants_count = tenant_counts["new_this_month"]
+    active_tenants_count = Lease.objects.aggregate(
+        active=Count("tenant", filter=Q(status=Lease.STATUS_ACTIVE), distinct=True)
+    )["active"]
+
+    return render(
+        request,
+        "admin_portal/tenants.html",
+        {
+            "page_obj": page_obj,
+            "q": q,
+            "lease_filter": lease_filter,
+            "total_tenants_count": total_tenants_count,
+            "active_tenants_count": active_tenants_count,
+            "new_tenants_count": new_tenants_count,
+        },
+    )
+
+
+@admin_required
+def admin_tenant_detail(request, tenant_id: int):
+    tenant = _get_tenant_profile_or_404(tenant_id, with_risk=True)
+    TenantRiskService.update_tenant_risk_classification(tenant.user)
+    tenant = _get_tenant_profile_or_404(tenant_id, with_risk=True)
+    leases = list(
+        Lease.objects.select_related("unit", "tenant").filter(tenant=tenant.user).order_by("-start_date")
+    )
+    display_lease = _tenant_display_lease(leases)
+    if display_lease and leases and leases[0].id != display_lease.id:
+        leases = [display_lease] + [lease for lease in leases if lease.id != display_lease.id]
+    attachments = TenantAttachment.objects.filter(tenant=tenant.user).select_related("uploaded_by").order_by("-uploaded_at")
+    tenant.has_records = tenant_has_records(tenant)
+
+    lease_ids = [lease.id for lease in leases]
+    current_month = timezone.localdate().replace(day=1)
+    bill_history = list(MonthlyBill.objects.filter(
+        lease_id__in=lease_ids,
+    ).filter(
+        Q(billing_month__lte=current_month) | Q(status="PAID")
+    ).select_related("lease__unit").order_by("billing_month", "id")[:24])
+
+    bill_ids_for_history = {bill.pk for bill in bill_history}
+    payments_by_bill_id = {}
+    approved_bill_payments = (
+        ManualPayment.objects.filter(user=tenant.user, status="APPROVED")
+        .exclude(bill_ids="")
+        .only("id", "bill_ids", "payment_method", "paid_via")
+        .order_by("created_at", "id")
+    )
+    for payment in approved_bill_payments:
+        for bill_id in _parse_payment_bill_ids(payment.bill_ids):
+            if bill_id in bill_ids_for_history:
+                payments_by_bill_id.setdefault(bill_id, []).append(payment)
+
+    for bill in bill_history:
+        bill.payment_method_label, bill.payment_method_provider = _monthly_bill_payment_method_summary(
+            payments_by_bill_id.get(bill.pk, [])
+        )
+
+    manual_payments = list(ManualPayment.objects.filter(user=tenant.user).order_by("-created_at")[:20])
+    payment_bill_ids = {}
+    page_bill_ids = set()
+    for payment in manual_payments:
+        bill_ids = _parse_payment_bill_ids(payment.bill_ids)
+        payment_bill_ids[payment.id] = bill_ids
+        page_bill_ids.update(bill_ids)
+    bills_by_id = {
+        bill.id: bill
+        for bill in MonthlyBill.objects.filter(pk__in=page_bill_ids).only("id", "billing_month")
+    }
+    for payment in manual_payments:
+        payment.covered_months = _format_covered_months(
+            [bills_by_id[bill_id] for bill_id in payment_bill_ids.get(payment.id, []) if bill_id in bills_by_id]
+        )
+
+    contract_events = list(
+        LeaseContractEvent.objects.filter(lease_id__in=lease_ids)
+        .select_related("lease__unit", "source_payment")
+        .order_by("occurred_at", "id")
+    )
+    event_payment_ids = {event.source_payment_id for event in contract_events}
+    leases_by_id = {lease.id: lease for lease in leases}
+    legacy_payments = (
+        ManualPayment.objects.filter(
+            user=tenant.user,
+            payment_type="move_in",
+            status="APPROVED",
+        )
+        .exclude(pk__in=event_payment_ids)
+        .select_related("lease")
+        .order_by("created_at", "id")
+    )
+    for payment in legacy_payments:
+        linked_lease = payment.lease if payment.lease_id in leases_by_id else None
+        if linked_lease is None and isinstance(payment.metadata, dict):
+            try:
+                metadata_lease_id = int(payment.metadata.get("lease_id"))
+            except (TypeError, ValueError):
+                metadata_lease_id = None
+            candidate = leases_by_id.get(metadata_lease_id)
+            if candidate and candidate.tenant_id == payment.user_id:
+                linked_lease = candidate
+
+        if linked_lease is None:
+            candidate_leases = set()
+            for bill_id in _parse_payment_bill_ids(payment.bill_ids):
+                bill = MonthlyBill.objects.filter(pk=bill_id, lease_id__in=lease_ids).select_related("lease").first()
+                if bill and bill.billing_month.replace(day=1) == bill.lease.start_date.replace(day=1):
+                    candidate_leases.add(bill.lease_id)
+            if len(candidate_leases) == 1:
+                linked_lease = leases_by_id[candidate_leases.pop()]
+
+        if linked_lease is None:
+            continue
+
+        occurred_at = payment.approved_at
+        legacy_derived = False
+        if occurred_at is None:
+            occurred_at = linked_lease.activated_at or payment.created_at
+            legacy_derived = True
+        contract_events.append(
+            SimpleNamespace(
+                lease=linked_lease,
+                event_type=LeaseContractEvent.EVENT_TYPE_MOVE_IN_PAYMENT,
+                status=LeaseContractEvent.STATUS_APPROVED,
+                occurred_at=occurred_at,
+                payment_reference=payment.reference_code,
+                payment_method=payment.get_payment_method_display(),
+                amount=payment.amount,
+                legacy_derived=legacy_derived,
+            )
+        )
+    contract_events.sort(key=lambda event: (event.occurred_at, getattr(event, "id", 0)))
+    next_url = request.GET.get("next", "")
+    back_url = (
+        next_url
+        if next_url and url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()})
+        else reverse("admin_tenants")
+    )
+
+    return render(
+        request,
+        "admin_portal/tenant_detail.html",
+        {
+            "tenant": tenant,
+            "leases": leases,
+            "display_lease": display_lease,
+            "attachments": attachments,
+            "bill_history": bill_history,
+            "manual_payments": manual_payments,
+            "contract_events": contract_events,
+            "back_url": back_url,
+        },
+    )
+
+
+@admin_required
+def admin_create_tenant_profile(request):
+    """
+    Admin portal: create a TenantProfile row with auto-generated password and email notification.
+    """
+    total_units = Unit.objects.filter(is_active=True).count()
+    total_tenants = TenantProfile.objects.count()
+    if total_tenants >= total_units:
+        messages.error(request, f"Cannot add more tenants. Maximum limit ({total_units} tenants for {total_units} units) reached.")
+        return redirect("admin_tenants")
+
+    form = TenantProfileForm(request.POST or None, request.FILES or None)
+
+    if request.method == "POST" and form.is_valid():
+        try:
+            tenant_profile = form.save(uploaded_by=request.user)
+
+            tenant_name = f"{tenant_profile.first_name} {tenant_profile.last_name}"
+            success_message = f"Tenant {tenant_name} has been created successfully! "
+            if getattr(tenant_profile, "credentials_email_sent", False):
+                success_message += f"Credentials email was sent to {tenant_profile.user.email}."
+            else:
+                success_message += (
+                    "Credentials were generated, but the email was not sent. "
+                    "Check Resend configuration and delivery logs."
+                )
+
+            messages.success(request, success_message)
+
+            try:
+                tenant_id = tenant_profile.user.id
+                return redirect(f"{reverse('admin_create_lease')}?tenant_id={tenant_id}")
+            except Exception as e:
+                logger.exception(
+                    "Failed to redirect to create lease for tenant %s: %s",
+                    getattr(tenant_profile.user, "id", None),
+                    e,
+                )
+                messages.warning(request, "Tenant created but could not prefill lease form. Redirecting to tenants list.")
+                return redirect("admin_tenants")
+
+        except Exception as e:
+            logger.exception("Failed to create tenant profile: %s", e)
+            messages.error(request, f"Error creating tenant: {str(e)}")
+
+    recent_tenants = TenantProfile.objects.all().order_by("-id")[:5]
+    return render(
+        request,
+        "admin_portal/tenant_form.html",
+        {
+            "title": "Add Tenant",
+            "form": form,
+            "recent_tenants": recent_tenants,
+            "back_url": reverse("admin_tenants"),
+        },
+    )
+
+
+@admin_required
+def admin_edit_tenant(request, tenant_id: int):
+    tenant = _get_tenant_profile_or_404(tenant_id)
+    attachments = list(
+        TenantAttachment.objects.filter(tenant=tenant.user)
+        .select_related("uploaded_by")
+        .order_by("-uploaded_at")
+    )
+    contract_attachments = [a for a in attachments if a.attachment_type == "CONTRACT"]
+    valid_id_attachments = [a for a in attachments if a.attachment_type == "VALID_ID"]
+    form = ComprehensiveTenantEditForm(tenant, request.POST or None, request.FILES or None)
+
+    if request.method == "POST" and form.is_valid():
+        try:
+            updated_tenant = form.save(uploaded_by=request.user)
+
+            try:
+                changes_made = []
+                if tenant.user.email != form.cleaned_data["email"]:
+                    changes_made.append("email")
+                if tenant.user.username != form.cleaned_data["username"]:
+                    changes_made.append("username")
+                if tenant.user.role != form.cleaned_data["role"]:
+                    changes_made.append("role")
+                if form.cleaned_data.get("new_password"):
+                    changes_made.append("password")
+
+                if changes_made:
+                    notification_title, notification_message = tenant_account_updated_notification_copy(
+                        tenant_name=f"{updated_tenant.first_name} {updated_tenant.last_name}".strip(),
+                        changed_fields=changes_made,
+                    )
+                    Notification.create_notification(
+                        title=notification_title,
+                        message=notification_message,
+                        notification_type="SYSTEM",
+                        recipient_type="ADMIN",
+                        related_tenant=updated_tenant.user,
+                    )
+            except Exception as e:
+                logger.exception("Failed to create tenant update notification: %s", e)
+
+            messages.success(request, f"Tenant {updated_tenant.first_name} {updated_tenant.last_name} has been updated successfully!")
+            return redirect("admin_tenant_detail", tenant_id=tenant.id)
+        except Exception as e:
+            messages.error(request, f"Error updating tenant: {str(e)}")
+            logger.exception("Error updating tenant")
+
+    return render(
+        request,
+        "admin_portal/comprehensive_tenant_edit.html",
+        {
+            "title": "Edit Tenant",
+            "form": form,
+            "tenant": tenant,
+            "attachments": attachments,
+            "contract_attachments": contract_attachments,
+            "valid_id_attachments": valid_id_attachments,
+            "back_url": reverse("admin_tenant_detail", args=[tenant.id]),
+        },
+    )
+
+
+@admin_required
+def admin_delete_tenant(request, tenant_id: int):
+    """
+    Delete tenant with password confirmation and archive options.
+    Phase 1: Password verification
+    Phase 2: Choose archive or permanent delete
+    """
+    from rentals.models import ArchivedTenant
+
+    tenant = _get_tenant_profile_or_404(tenant_id)
+    user = tenant.user
+    has_records = tenant_has_records(tenant)
+
+    if request.method == "POST" and request.POST.get("phase") == "2":
+        admin_password = request.POST.get("admin_password", "").strip()
+        if not request.user.check_password(admin_password):
+            messages.error(request, "Password verification failed. Action cancelled.")
+            return redirect("admin_tenant_detail", tenant_id=tenant.id)
+
+        deletion_type = request.POST.get("deletion_type", "")
+        deletion_reason = request.POST.get("deletion_reason", "").strip()
+
+        tenant_data = {
+            "full_name": tenant.full_name,
+            "first_name": tenant.first_name,
+            "last_name": tenant.last_name,
+            "email": user.email,
+            "contact_no": tenant.contact_no,
+            "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
+            "has_records": has_records,
+        }
+
+        if has_records:
+            # Convert Decimal fields to float for JSON serialization
+            leases_raw = list(
+                Lease.objects.filter(tenant=user).values(
+                    "id",
+                    "unit__number",
+                    "monthly_rent",
+                    "start_date",
+                    "end_date",
+                    "is_active",
+                )
+            )
+            leases = [
+                {
+                    **lease,
+                    "monthly_rent": float(lease["monthly_rent"]) if lease["monthly_rent"] else None,
+                }
+                for lease in leases_raw
+            ]
+            
+            payments_raw = list(
+                ManualPayment.objects.filter(user=user).values(
+                    "id",
+                    "amount",
+                    "payment_method",
+                    "status",
+                    "created_at",
+                )[:10]
+            )
+            payments = [
+                {
+                    **payment,
+                    "amount": float(payment["amount"]) if payment["amount"] else None,
+                }
+                for payment in payments_raw
+            ]
+            maintenance = list(
+                MaintenanceRequest.objects.filter(tenant=user).values(
+                    "id",
+                    "title",
+                    "status",
+                    "created_at",
+                )[:10]
+            )
+
+            tenant_data["records_summary"] = {
+                "leases": leases,
+                "payments_count": ManualPayment.objects.filter(user=user).count(),
+                "payments_sample": payments,
+                "maintenance_count": MaintenanceRequest.objects.filter(tenant=user).count(),
+                "maintenance_sample": maintenance,
+            }
+
+        tenant_data = _archive_json_safe(tenant_data)
+
+        if deletion_type == "ARCHIVE":
+            ArchivedTenant.objects.create(
+                original_user_id=user.id,
+                original_tenant_id=tenant.id,
+                email=user.email,
+                tenant_data=tenant_data,
+                archive_type="DEACTIVATED",
+                deleted_by=request.user,
+                deletion_reason=deletion_reason,
+                can_be_restored=True,
+            )
+
+            deactivate_tenant(tenant)
+            messages.success(
+                request,
+                f"Tenant {tenant.full_name} archived and deactivated. All records preserved. Unit is now available.",
+            )
+
+        elif deletion_type == "SOFT_DELETE":
+            if has_records:
+                messages.error(
+                    request,
+                    "Soft delete is only allowed for tenants without lease, billing, payment, maintenance, or attachment records. Use Archive instead.",
+                )
+                return redirect("admin_tenant_detail", tenant_id=tenant.id)
+
+            full_name = tenant.full_name
+            ArchivedTenant.objects.create(
+                original_user_id=user.id,
+                original_tenant_id=tenant.id,
+                email=user.email,
+                tenant_data=tenant_data,
+                archive_type="DELETED_SOFT",
+                deleted_by=request.user,
+                deletion_reason=deletion_reason,
+                can_be_restored=True,
+            )
+            tenant.delete()
+            user.delete()
+            messages.success(
+                request,
+                f"Tenant {full_name} was soft deleted. The live account was removed and the archive can still be restored.",
+            )
+
+        elif deletion_type == "HARD_DELETE":
+            if has_records:
+                messages.error(
+                    request,
+                    "Hard delete is blocked for tenants with historical records because it can remove billing ledger history and affect forecasting. Use Archive instead.",
+                )
+                return redirect("admin_tenant_detail", tenant_id=tenant.id)
+
+            full_name = tenant.full_name
+            ArchivedTenant.objects.create(
+                original_user_id=user.id,
+                original_tenant_id=tenant.id,
+                email=user.email,
+                tenant_data=tenant_data,
+                archive_type="DELETED_HARD",
+                deleted_by=request.user,
+                deletion_reason=deletion_reason,
+                can_be_restored=False,
+            )
+            tenant.delete()
+            user.delete()
+            messages.success(
+                request,
+                f"Tenant {full_name} was permanently hard deleted. Only the audit archive remains.",
+            )
+        else:
+            messages.error(request, "Invalid deletion type selected.")
+            return redirect("admin_tenant_detail", tenant_id=tenant.id)
+
+        return redirect("admin_tenants")
+
+    if request.method == "POST":
+        admin_password = request.POST.get("admin_password", "").strip()
+
+        if not request.user.check_password(admin_password):
+            return render(
+                request,
+                "admin_portal/confirm_delete_tenant.html",
+                {
+                    "title": "Security Verification Failed",
+                    "error": "Incorrect password. Please try again.",
+                    "tenant": tenant,
+                    "has_records": has_records,
+                    "phase": 1,
+                    "post_url": reverse("admin_delete_tenant", args=[tenant.id]),
+                    "back_url": reverse("admin_tenant_detail", args=[tenant.id]),
+                },
+            )
+
+        return render(
+            request,
+            "admin_portal/confirm_delete_tenant.html",
+            {
+                "title": "Select Deletion Option",
+                "tenant": tenant,
+                "has_records": has_records,
+                "phase": 2,
+                "post_url": reverse("admin_delete_tenant", args=[tenant.id]),
+                "back_url": reverse("admin_tenant_detail", args=[tenant.id]),
+            },
+        )
+
+    return render(
+        request,
+        "admin_portal/confirm_delete_tenant.html",
+        {
+            "title": "Security Verification Required",
+            "message": (
+                f"You are attempting to delete tenant: {tenant.full_name}\n\n"
+                f"For security, please enter your admin password to continue. "
+                f"You will then be able to choose between archive, soft delete, or hard delete depending on the tenant record state."
+            ),
+            "tenant": tenant,
+            "has_records": has_records,
+            "phase": 1,
+            "post_url": reverse("admin_delete_tenant", args=[tenant.id]),
+            "back_url": reverse("admin_tenant_detail", args=[tenant.id]),
+        },
+    )
+
+
+@admin_required
+def admin_tenant_attachments(request, tenant_id: int):
+    """Admin portal: view and manage tenant attachments with image preview"""
+    tenant = _get_tenant_profile_or_404(tenant_id)
+    attachments = TenantAttachment.objects.filter(tenant=tenant.user).select_related("uploaded_by").order_by("-uploaded_at")
+
+    return render(
+        request,
+        "admin_portal/tenant_attachments.html",
+        {
+            "tenant": tenant,
+            "attachments": attachments,
+        },
+    )
+
+
+@admin_required
+@require_GET
+def admin_view_attachment(request, attachment_id: int):
+    """Admin portal: view attachment file with image preview support"""
+    attachment = get_object_or_404(TenantAttachment, pk=attachment_id)
+
+    if not attachment.file:
+        raise Http404("Attachment file is not available.")
+
+    content_type = mimetypes.guess_type(attachment.filename)[0] or "application/octet-stream"
+    try:
+        attachment.file.open("rb")
+    except (FileNotFoundError, OSError):
+        raise Http404("Attachment file is not available.")
+
+    response = FileResponse(attachment.file, content_type=content_type)
+    response["Content-Disposition"] = f'attachment; filename="{attachment.filename}"'
+    response["X-Content-Type-Options"] = "nosniff"
+
+    return response
+
+
+@admin_required
+def admin_delete_attachment(request, attachment_id: int):
+    """Admin portal: delete tenant attachment"""
+    attachment = get_object_or_404(TenantAttachment.objects.select_related("tenant__tenantprofile"), pk=attachment_id)
+    tenant_id = attachment.tenant.tenantprofile.id
+
+    if request.method == "POST":
+        if not admin_password_verified(request):
+            error = None
+            if request.POST.get("admin_password"):
+                error = "Incorrect admin password. Attachment deletion was not completed."
+            return render_admin_password_confirm(
+                request,
+                title="Delete Attachment",
+                message=f"Delete attachment '{attachment.filename}'? This cannot be undone.",
+                post_url=reverse("admin_delete_attachment", args=[attachment.id]),
+                back_url=reverse("admin_tenant_attachments", args=[tenant_id]),
+                error=error,
+                attachment=attachment,
+            )
+        if attachment.file:
+            try:
+                attachment.file.delete(save=False)
+            except (FileNotFoundError, OSError):
+                logger.warning("Attachment file missing during delete: %s", attachment.file.name)
+        attachment.delete()
+        messages.success(request, f"Attachment '{attachment.filename}' has been deleted successfully.")
+        return redirect("admin_tenant_attachments", tenant_id=tenant_id)
+
+    return render_admin_password_confirm(
+        request,
+        title="Delete Attachment",
+        message=f"Delete attachment '{attachment.filename}'? This cannot be undone.",
+        post_url=reverse("admin_delete_attachment", args=[attachment.id]),
+        back_url=reverse("admin_tenant_attachments", args=[tenant_id]),
+        attachment=attachment,
+    )

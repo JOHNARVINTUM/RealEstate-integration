@@ -1,0 +1,1447 @@
+from datetime import date, datetime
+from decimal import Decimal
+from unittest.mock import patch
+
+from django.db import IntegrityError
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.utils import timezone
+
+from accounts.models import User
+from accounts.ml.maintenance_nlp import classify_issue_category
+from maintenance.forms import AdminMaintenanceUpdateForm
+from maintenance.models import MaintenanceCharge, MaintenanceRequest, MaintenanceSupplyOrder
+from maintenance.services import post_maintenance_charge_to_billing
+from rentals.models import Lease, Notification, TenantProfile, Unit
+from billing.models import BillLineItem, MonthlyBill
+
+
+class MaintenanceNLPTests(TestCase):
+    def test_classify_issue_category_detects_plumbing(self):
+        result = classify_issue_category("There is water leaking under the sink and the drain is clogged.")
+
+        self.assertEqual(result["category"], "PLUMBING")
+        self.assertGreater(result["confidence"], 0)
+        self.assertIn("water", result["matched_keywords"])
+
+    def test_classify_issue_category_falls_back_to_other(self):
+        result = classify_issue_category("Please check the room because something feels unusual.")
+
+        self.assertEqual(result["category"], "OTHER")
+        self.assertEqual(result["confidence"], 0.0)
+
+
+class MaintenanceSubmissionTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="admin@example.com",
+            username="adminuser",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="staff@example.com",
+            username="staffuser",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.user = User.objects.create_user(
+            email="tenant@example.com",
+            username="tenantuser",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.user,
+            first_name="Test",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=self.admin,
+        )
+        TenantProfile.objects.create(
+            user=self.staff,
+            first_name="Assigned",
+            last_name="Staff",
+            password_change_required=False,
+            created_by=self.admin,
+        )
+        self.unit = Unit.objects.create(
+            number="101",
+            unit_type="STUDIO",
+            floor_level=1,
+            size_sqm=24,
+            monthly_rent=10000,
+            status="OCCUPIED",
+            is_active=True,
+        )
+        self.lease = Lease.objects.create(
+            tenant=self.user,
+            unit=self.unit,
+            monthly_rent=10000,
+            due_day=5,
+            start_date=date.today(),
+            security_deposit=20000,
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.client.force_login(self.user)
+
+    @patch("accounts.ml.maintenance_nlp.predict_priority")
+    def test_report_issue_auto_populates_category_and_priority(self, mock_predict_priority):
+        mock_predict_priority.return_value = {
+            "priority": "HIGH",
+            "confidence": 0.91,
+            "available": True,
+        }
+
+        response = self.client.post(
+            reverse("report_issue"),
+            {
+                "title": "Sink issue",
+                "description": "There is water leaking under the sink and the drain is clogged.",
+                "requested_schedule_at": "2026-06-15T13:00",
+            },
+        )
+
+        self.assertRedirects(response, reverse("report_issue"))
+
+        request_obj = MaintenanceRequest.objects.get()
+        self.assertEqual(request_obj.category, "PLUMBING")
+        self.assertEqual(request_obj.priority, "HIGH")
+        self.assertEqual(request_obj.nlp_priority, "HIGH")
+        self.assertEqual(request_obj.nlp_priority_confidence, 0.91)
+        self.assertEqual(timezone.localtime(request_obj.requested_schedule_at).replace(tzinfo=None), datetime(2026, 6, 15, 13, 0))
+        self.assertEqual(request_obj.review_status, "PENDING")
+        self.assertIsNone(request_obj.assigned_staff)
+
+    @patch("accounts.ml.maintenance_nlp.predict_priority", return_value={"available": True, "priority": "HIGH", "confidence": 0.9})
+    def test_success_feedback_shows_request_summary_and_preserves_notification(self, _mock_predict_priority):
+        response = self.client.post(
+            reverse("report_issue"),
+            {
+                "title": "Leaking bathroom faucet",
+                "description": "The bathroom faucet leaks when turned off.",
+                "requested_schedule_at": "2026-06-15T13:00",
+            },
+        )
+
+        self.assertRedirects(response, reverse("report_issue"), fetch_redirect_response=False)
+        self.assertEqual(MaintenanceRequest.objects.filter(tenant=self.user).count(), 1)
+        self.assertEqual(Notification.objects.filter(recipient_type="ADMIN", notification_type="MAINTENANCE").count(), 1)
+        notification = Notification.objects.get(recipient_type="ADMIN", notification_type="MAINTENANCE")
+        self.assertEqual(notification.related_tenant, self.user)
+        self.assertEqual(notification.related_unit, self.unit)
+
+        confirmation = self.client.get(response.url)
+        self.assertEqual(confirmation.status_code, 200)
+        self.assertContains(confirmation, "Maintenance request submitted")
+        self.assertContains(confirmation, "Thanks for letting us know.")
+        self.assertContains(confirmation, "Leaking bathroom faucet")
+        self.assertContains(confirmation, "Room 101")
+        self.assertContains(confirmation, "High")
+        self.assertContains(confirmation, reverse("maintenance_list"), html=False)
+        self.assertContains(confirmation, reverse("report_issue"), html=False)
+
+        # Refreshing the confirmation GET returns to the form instead of replaying the POST.
+        refreshed = self.client.get(response.url)
+        self.assertNotContains(refreshed, "Maintenance request submitted")
+        self.assertEqual(MaintenanceRequest.objects.filter(tenant=self.user).count(), 1)
+        self.assertEqual(Notification.objects.filter(recipient_type="ADMIN", notification_type="MAINTENANCE").count(), 1)
+
+    def test_invalid_report_preserves_input_and_displays_field_errors_without_saving(self):
+        response = self.client.post(
+            reverse("report_issue"),
+            {
+                "title": "",
+                "description": "",
+                "requested_schedule_at": "2026-06-15T13:00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Please review the highlighted fields and try again.")
+        self.assertContains(response, "This field is required.")
+        self.assertEqual(response.context["form"]["title"].value(), "")
+        self.assertEqual(MaintenanceRequest.objects.filter(tenant=self.user).count(), 0)
+        self.assertEqual(Notification.objects.filter(recipient_type="ADMIN", notification_type="MAINTENANCE").count(), 0)
+
+    def test_save_failure_shows_safe_error_without_exposing_exception(self):
+        with patch("maintenance.views.MaintenanceRequest.save", side_effect=RuntimeError("database connection details")):
+            response = self.client.post(
+                reverse("report_issue"),
+                {
+                    "title": "Broken light",
+                    "description": "The bedroom light will not turn on.",
+                    "requested_schedule_at": "2026-06-15T13:00",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Couldn't submit your maintenance request.")
+        self.assertContains(response, "Please try again. Your request was not submitted.")
+        self.assertNotContains(response, "database connection details")
+        self.assertEqual(MaintenanceRequest.objects.filter(tenant=self.user).count(), 0)
+
+    def test_report_form_disables_submit_button_and_shows_loading_state(self):
+        response = self.client.get(reverse("report_issue"))
+
+        self.assertContains(response, "Submitting request...")
+        self.assertContains(response, "submitButton.disabled = true")
+        self.assertContains(response, "maintenanceReportForm")
+
+    def test_admin_approval_uses_tenant_requested_schedule_when_blank(self):
+        request_obj = MaintenanceRequest.objects.create(
+            tenant=self.user,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Sink issue",
+            description="There is water leaking under the sink.",
+            requested_schedule_at=timezone.make_aware(datetime(2026, 6, 15, 13, 0)),
+        )
+
+        form = AdminMaintenanceUpdateForm(
+            {
+                "category": "PLUMBING",
+                "status": "OPEN",
+                "priority": "MEDIUM",
+                "review_status": "ACCEPTED",
+                "assigned_staff": self.staff.id,
+                "fixed_by": "",
+                "schedule_decision": "APPROVED",
+                "admin_scheduled_at": "",
+                "schedule_admin_note": "Approved by admin.",
+            },
+            instance=request_obj,
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.cleaned_data["admin_scheduled_at"], request_obj.requested_schedule_at)
+
+    def test_report_issue_uses_date_valid_active_lease_even_if_is_active_flag_is_false(self):
+        self.lease.is_active = False
+        self.lease.save(update_fields=["is_active"])
+
+        response = self.client.post(
+            reverse("report_issue"),
+            {
+                "title": "Outlet issue",
+                "description": "The outlet sparked near the desk.",
+                "requested_schedule_at": "2026-06-15T13:00",
+            },
+        )
+
+        self.assertRedirects(response, reverse("report_issue"))
+        request_obj = MaintenanceRequest.objects.latest("id")
+        self.assertEqual(request_obj.lease_id, self.lease.id)
+
+
+class MaintenanceWorkflowTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="workflow-admin@example.com",
+            username="workflowadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="workflow-staff@example.com",
+            username="workflowstaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.other_staff = User.objects.create_user(
+            email="workflow-staff-2@example.com",
+            username="workflowstaff2",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="workflow-tenant@example.com",
+            username="workflowtenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(user=self.staff, first_name="Assigned", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.other_staff, first_name="Other", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.tenant, first_name="Tenant", last_name="User", password_change_required=False, created_by=self.admin)
+        self.unit = Unit.objects.create(number="M-101", monthly_rent=10000, status="OCCUPIED", is_active=True)
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=10000,
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Pipe leak",
+            description="Water is leaking under the kitchen sink.",
+            requested_schedule_at=timezone.make_aware(datetime(2026, 6, 20, 9, 0)),
+            status="OPEN",
+            review_status="PENDING",
+        )
+
+    def test_admin_can_accept_and_assign_staff(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_update_maintenance", args=[self.request_obj.id]),
+            {
+                "category": "PLUMBING",
+                "priority": "HIGH",
+                "review_status": "ACCEPTED",
+                "assigned_staff": self.staff.id,
+                "status": "OPEN",
+                "fixed_by": "",
+                "schedule_decision": "APPROVED",
+                "admin_scheduled_at": "",
+                "schedule_admin_note": "Please start tomorrow morning.",
+            },
+        )
+
+        self.assertRedirects(response, reverse("admin_maintenance"))
+        self.request_obj.refresh_from_db()
+        self.assertEqual(self.request_obj.review_status, "ACCEPTED")
+        self.assertEqual(self.request_obj.assigned_staff, self.staff)
+        self.assertEqual(self.request_obj.status, "OPEN")
+        self.assertEqual(self.request_obj.admin_scheduled_at, self.request_obj.requested_schedule_at)
+
+    def test_admin_can_reject_request_and_clear_assignment(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.staff
+        self.request_obj.status = "IN_PROGRESS"
+        self.request_obj.save(update_fields=["review_status", "assigned_staff", "status"])
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            reverse("admin_update_maintenance", args=[self.request_obj.id]),
+            {
+                "category": "PLUMBING",
+                "priority": "MEDIUM",
+                "review_status": "REJECTED",
+                "assigned_staff": "",
+                "status": "OPEN",
+                "fixed_by": "",
+                "schedule_decision": "DECLINED",
+                "admin_scheduled_at": "",
+                "schedule_admin_note": "Duplicate request.",
+            },
+        )
+
+        self.assertRedirects(response, reverse("admin_maintenance"))
+        self.request_obj.refresh_from_db()
+        self.assertEqual(self.request_obj.review_status, "REJECTED")
+        self.assertIsNone(self.request_obj.assigned_staff)
+        self.assertEqual(self.request_obj.status, "CLOSED")
+
+    def test_staff_only_sees_assigned_accepted_requests(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.staff
+        self.request_obj.save(update_fields=["review_status", "assigned_staff"])
+        other_request = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="ELECTRICAL",
+            title="Outlet issue",
+            description="Outlet is not working.",
+            review_status="ACCEPTED",
+            assigned_staff=self.other_staff,
+            status="OPEN",
+        )
+        self.client.force_login(self.staff)
+
+        response = self.client.get(reverse("admin_maintenance"))
+
+        self.assertEqual(response.status_code, 200)
+        visible_ids = [row.id for row in response.context["page_obj"].object_list]
+        self.assertIn(self.request_obj.id, visible_ids)
+        self.assertNotIn(other_request.id, visible_ids)
+
+    def test_staff_cannot_open_unassigned_request(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.other_staff
+        self.request_obj.save(update_fields=["review_status", "assigned_staff"])
+        self.client.force_login(self.staff)
+
+        response = self.client.get(reverse("admin_update_maintenance", args=[self.request_obj.id]))
+
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(BUILTASUPPLY_SHOP_URL="https://shop.example.test/catalog/")
+    def test_admin_sees_plain_builtasupply_link_for_accepted_request(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.save(update_fields=["review_status"])
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_update_maintenance", args=[self.request_obj.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Browse supplies on BUILTASUPPLY")
+        self.assertContains(
+            response,
+            'href="https://shop.example.test/catalog/" target="_blank" rel="noopener noreferrer"',
+        )
+
+    def test_admin_does_not_see_builtasupply_link_for_unaccepted_request(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_update_maintenance", args=[self.request_obj.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Browse supplies on BUILTASUPPLY")
+
+    @override_settings(BUILTASUPPLY_SHOP_URL="https://shop.example.test/catalog/")
+    def test_only_assigned_staff_sees_builtasupply_link_for_accepted_request(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.staff
+        self.request_obj.save(update_fields=["review_status", "assigned_staff"])
+        self.client.force_login(self.staff)
+
+        response = self.client.get(reverse("admin_update_maintenance", args=[self.request_obj.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Browse supplies on BUILTASUPPLY")
+
+    def test_tenant_cannot_access_page_or_see_builtasupply_link(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.save(update_fields=["review_status"])
+        self.client.force_login(self.tenant)
+
+        response = self.client.get(reverse("admin_update_maintenance", args=[self.request_obj.id]))
+
+        self.assertRedirects(response, reverse("tenant_dashboard"), fetch_redirect_response=False)
+        self.assertNotContains(response, "Browse supplies on BUILTASUPPLY")
+
+    def test_staff_can_update_assigned_request_status(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.staff
+        self.request_obj.status = "OPEN"
+        self.request_obj.save(update_fields=["review_status", "assigned_staff", "status"])
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            reverse("admin_update_maintenance", args=[self.request_obj.id]),
+            {
+                "status": "RESOLVED",
+                "fixed_by": "Assigned Staff",
+            },
+        )
+
+        self.assertRedirects(response, reverse("admin_maintenance"))
+        self.request_obj.refresh_from_db()
+        self.assertEqual(self.request_obj.review_status, "ACCEPTED")
+        self.assertEqual(self.request_obj.assigned_staff, self.staff)
+        self.assertEqual(self.request_obj.status, "RESOLVED")
+        self.assertEqual(self.request_obj.fixed_by, "Assigned Staff")
+        self.assertIsNotNone(self.request_obj.resolved_at)
+
+    def test_tenant_request_history_shows_review_and_assignment(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.staff
+        self.request_obj.status = "IN_PROGRESS"
+        self.request_obj.save(update_fields=["review_status", "assigned_staff", "status"])
+        self.client.force_login(self.tenant)
+
+        response = self.client.get(reverse("maintenance_list"), follow=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Pipe leak")
+        self.assertContains(response, "In Progress")
+
+    def test_staff_marking_request_done_creates_admin_notification(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.staff
+        self.request_obj.status = "IN_PROGRESS"
+        self.request_obj.save(update_fields=["review_status", "assigned_staff", "status"])
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            reverse("admin_update_maintenance", args=[self.request_obj.id]),
+            {
+                "status": "RESOLVED",
+                "fixed_by": "Assigned Staff",
+            },
+        )
+
+        self.assertRedirects(response, reverse("admin_maintenance"))
+        notification = Notification.objects.filter(recipient_type="ADMIN", title="Maintenance work marked complete").latest("created_at")
+        self.assertIn("Pipe leak", notification.message)
+        self.assertIn("Assigned Staff", notification.message)
+        self.assertEqual(notification.related_tenant, self.tenant)
+        self.assertEqual(notification.related_unit, self.unit)
+
+
+class MaintenanceChargeSuggestionWorkflowTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="charge-flow-admin@example.com",
+            username="chargeflowadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="charge-flow-staff@example.com",
+            username="chargeflowstaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.other_staff = User.objects.create_user(
+            email="charge-flow-staff-2@example.com",
+            username="chargeflowstaff2",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="charge-flow-tenant@example.com",
+            username="chargeflowtenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(user=self.staff, first_name="Charge", last_name="Worker", created_by=self.admin)
+        TenantProfile.objects.create(user=self.other_staff, first_name="Other", last_name="Worker", created_by=self.admin)
+        TenantProfile.objects.create(user=self.tenant, first_name="Charge", last_name="Tenant", created_by=self.admin)
+        self.unit = Unit.objects.create(number="MC-201", monthly_rent=12000, status="OCCUPIED", is_active=True)
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=12000,
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Pipe repair",
+            description="Pipe under the sink needs repair.",
+            requested_schedule_at=timezone.make_aware(datetime(2026, 6, 21, 10, 0)),
+            status="OPEN",
+            review_status="ACCEPTED",
+            assigned_staff=self.staff,
+        )
+
+    def _charge_url(self):
+        return reverse("admin_update_maintenance", args=[self.request_obj.id])
+
+    def test_assigned_staff_can_create_charge_suggestion(self):
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_suggestion",
+                "diagnosis": "Pipe joint is damaged.",
+                "repair_notes": "Replace the connector and retighten fittings.",
+                "labor_cost": "650.00",
+                "material_cost": "350.00",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        charge = MaintenanceCharge.objects.get(maintenance_request=self.request_obj)
+        self.assertEqual(charge.suggested_by, self.staff)
+        self.assertEqual(charge.diagnosis, "Pipe joint is damaged.")
+        self.assertEqual(charge.repair_notes, "Replace the connector and retighten fittings.")
+        self.assertEqual(charge.labor_cost, Decimal("650.00"))
+        self.assertEqual(charge.material_cost, Decimal("350.00"))
+        self.assertEqual(charge.suggested_total, Decimal("1000.00"))
+        self.assertEqual(charge.status, MaintenanceCharge.STATUS_PENDING_REVIEW)
+
+    def test_assigned_staff_can_update_pending_review_suggestion(self):
+        charge = MaintenanceCharge.objects.create(
+            maintenance_request=self.request_obj,
+            suggested_by=self.staff,
+            diagnosis="Initial diagnosis",
+            repair_notes="Initial notes",
+            labor_cost=Decimal("200.00"),
+            material_cost=Decimal("50.00"),
+        )
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_suggestion",
+                "diagnosis": "Updated diagnosis",
+                "repair_notes": "Updated repair notes",
+                "labor_cost": "500.00",
+                "material_cost": "125.00",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        charge.refresh_from_db()
+        self.assertEqual(charge.diagnosis, "Updated diagnosis")
+        self.assertEqual(charge.repair_notes, "Updated repair notes")
+        self.assertEqual(charge.suggested_total, Decimal("625.00"))
+        notification = Notification.objects.filter(recipient_type="ADMIN", title="Repair estimate updated").latest("created_at")
+        self.assertIn("₱625.00", notification.message)
+        self.assertEqual(notification.related_tenant, self.tenant)
+        self.assertEqual(notification.related_unit, self.unit)
+
+    def test_assigned_staff_creating_initial_amount_creates_admin_notification(self):
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_suggestion",
+                "diagnosis": "Pipe joint is damaged.",
+                "repair_notes": "Replace the connector and retighten fittings.",
+                "labor_cost": "650.00",
+                "material_cost": "350.00",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        notification = Notification.objects.filter(recipient_type="ADMIN", title="Repair estimate received").latest("created_at")
+        self.assertIn("Pipe repair", notification.message)
+        self.assertIn("₱1,000.00", notification.message)
+        self.assertEqual(notification.related_tenant, self.tenant)
+        self.assertEqual(notification.related_unit, self.unit)
+
+    def test_unassigned_staff_cannot_create_or_update_charge_suggestion(self):
+        self.request_obj.assigned_staff = self.other_staff
+        self.request_obj.save(update_fields=["assigned_staff"])
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_suggestion",
+                "diagnosis": "Should fail",
+                "repair_notes": "Should fail",
+                "labor_cost": "100.00",
+                "material_cost": "50.00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(MaintenanceCharge.objects.filter(maintenance_request=self.request_obj).exists())
+
+    def test_staff_cannot_edit_charge_after_admin_decision(self):
+        charge = MaintenanceCharge.objects.create(
+            maintenance_request=self.request_obj,
+            suggested_by=self.staff,
+            diagnosis="Locked diagnosis",
+            repair_notes="Locked notes",
+            labor_cost=Decimal("400.00"),
+            material_cost=Decimal("100.00"),
+            admin_approved_total=Decimal("550.00"),
+            status=MaintenanceCharge.STATUS_APPROVED,
+            approved_by=self.admin,
+            approved_at=timezone.now(),
+        )
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_suggestion",
+                "diagnosis": "Changed diagnosis",
+                "repair_notes": "Changed notes",
+                "labor_cost": "999.00",
+                "material_cost": "1.00",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        charge.refresh_from_db()
+        self.assertEqual(charge.diagnosis, "Locked diagnosis")
+        self.assertEqual(charge.repair_notes, "Locked notes")
+        self.assertEqual(charge.suggested_total, Decimal("500.00"))
+        self.assertEqual(charge.status, MaintenanceCharge.STATUS_APPROVED)
+
+    def test_staff_cannot_set_admin_fields_or_bill_link(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 6, 1),
+            due_date=date(2026, 6, 5),
+            base_rent=Decimal("12000.00"),
+            total_due=Decimal("12000.00"),
+            status="UNPAID",
+        )
+        line_item = BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("900.00"),
+        )
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_suggestion",
+                "diagnosis": "Pipe replacement",
+                "repair_notes": "Materials and labor estimated.",
+                "labor_cost": "700.00",
+                "material_cost": "200.00",
+                "admin_approved_total": "9999.99",
+                "status": MaintenanceCharge.STATUS_ADDED_TO_BILL,
+                "approved_by": str(self.admin.id),
+                "approved_at": timezone.now().isoformat(),
+                "bill_line_item": str(line_item.id),
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        charge = MaintenanceCharge.objects.get(maintenance_request=self.request_obj)
+        self.assertIsNone(charge.admin_approved_total)
+        self.assertIsNone(charge.approved_by)
+        self.assertIsNone(charge.approved_at)
+        self.assertIsNone(charge.bill_line_item)
+        self.assertEqual(charge.status, MaintenanceCharge.STATUS_PENDING_REVIEW)
+
+    def test_non_accepted_request_cannot_receive_charge_suggestion(self):
+        for review_status in ("PENDING", "REJECTED"):
+            with self.subTest(review_status=review_status):
+                MaintenanceCharge.objects.filter(maintenance_request=self.request_obj).delete()
+                self.request_obj.review_status = review_status
+                self.request_obj.save(update_fields=["review_status"])
+                self.client.force_login(self.staff)
+
+                response = self.client.post(
+                    self._charge_url(),
+                    {
+                        "form_action": "charge_suggestion",
+                        "diagnosis": "Should not save",
+                        "repair_notes": "Should not save",
+                        "labor_cost": "100.00",
+                        "material_cost": "25.00",
+                    },
+                )
+
+                self.assertEqual(response.status_code, 404)
+                self.assertFalse(MaintenanceCharge.objects.filter(maintenance_request=self.request_obj).exists())
+
+
+class MaintenanceAdminArchiveTests(TestCase):
+    def setUp(self):
+        self.admin_user = User.objects.create_user(
+            email="admin@example.com",
+            username="adminuser",
+            password="password123",
+            role=User.Role.ADMIN,
+            is_staff=True,
+        )
+        self.tenant_user = User.objects.create_user(
+            email="tenant-archive@example.com",
+            username="tenantarchive",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.client.force_login(self.admin_user)
+
+    def test_admin_maintenance_archives_orphaned_requests(self):
+        request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant_user,
+            lease=None,
+            category="OTHER",
+            title="Old request",
+            description="Unit was deleted after this request was created.",
+            status="OPEN",
+        )
+
+        response = self.client.get(reverse("admin_maintenance"))
+
+        self.assertEqual(response.status_code, 200)
+        request_obj.refresh_from_db()
+        self.assertEqual(request_obj.status, "CLOSED")
+        self.assertEqual(request_obj.review_status, "REJECTED")
+        self.assertIsNotNone(request_obj.resolved_at)
+        self.assertIn("linked lease or unit is no longer available", request_obj.schedule_admin_note.lower())
+        self.assertNotContains(response, "Old request")
+
+    def test_admin_maintenance_can_filter_archived_requests(self):
+        request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant_user,
+            lease=None,
+            category="OTHER",
+            title="Archived request",
+            description="Archived because the unit is no longer linked.",
+            status="OPEN",
+        )
+
+        response = self.client.get(reverse("admin_maintenance"), {"status": "CLOSED"})
+
+        self.assertEqual(response.status_code, 200)
+        request_obj.refresh_from_db()
+        self.assertEqual(request_obj.status, "CLOSED")
+        self.assertContains(response, "Archived because the unit is no longer linked.")
+        self.assertContains(response, "Rejected")
+
+
+class MaintenanceChargeAdminReviewWorkflowTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="charge-review-admin@example.com",
+            username="chargereviewadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="charge-review-staff@example.com",
+            username="chargereviewstaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="charge-review-tenant@example.com",
+            username="chargereviewtenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(user=self.staff, first_name="Review", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.tenant, first_name="Review", last_name="Tenant", created_by=self.admin)
+        self.unit = Unit.objects.create(number="MC-301", monthly_rent=13000, status="OCCUPIED", is_active=True)
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=13000,
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Pipe repair",
+            description="Pipe under the sink needs repair.",
+            requested_schedule_at=timezone.make_aware(datetime(2026, 6, 21, 10, 0)),
+            status="OPEN",
+            review_status="ACCEPTED",
+            assigned_staff=self.staff,
+        )
+        self.charge = MaintenanceCharge.objects.create(
+            maintenance_request=self.request_obj,
+            suggested_by=self.staff,
+            diagnosis="Pipe joint is damaged.",
+            repair_notes="Replace the connector and retighten fittings.",
+            labor_cost=Decimal("650.00"),
+            material_cost=Decimal("350.00"),
+        )
+
+    def _charge_url(self):
+        return reverse("admin_update_maintenance", args=[self.request_obj.id])
+
+    def test_admin_can_approve_charge_as_is(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_review",
+                "charge_review_action": "approve_as_is",
+                "admin_approved_total": "",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_ADDED_TO_BILL)
+        self.assertEqual(self.charge.admin_approved_total, Decimal("1000.00"))
+        self.assertEqual(self.charge.approved_by, self.admin)
+        self.assertIsNotNone(self.charge.approved_at)
+        self.assertIsNotNone(self.charge.bill_line_item)
+
+    def test_admin_can_approve_charge_with_adjusted_amount(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_review",
+                "charge_review_action": "approve_adjusted",
+                "admin_approved_total": "875.50",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_ADDED_TO_BILL)
+        self.assertEqual(self.charge.admin_approved_total, Decimal("875.50"))
+        self.assertEqual(self.charge.approved_by, self.admin)
+        self.assertIsNotNone(self.charge.approved_at)
+        self.assertIsNotNone(self.charge.bill_line_item)
+
+    def test_admin_can_mark_no_charge(self):
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_review",
+                "charge_review_action": "no_charge",
+                "admin_approved_total": "0.00",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_NO_CHARGE)
+        self.assertIsNone(self.charge.admin_approved_total)
+        self.assertEqual(self.charge.approved_by, self.admin)
+        self.assertIsNotNone(self.charge.approved_at)
+        self.assertIsNone(self.charge.bill_line_item)
+
+    def test_admin_cannot_review_charge_for_non_accepted_request(self):
+        self.request_obj.review_status = "PENDING"
+        self.request_obj.save(update_fields=["review_status"])
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_review",
+                "charge_review_action": "approve_as_is",
+                "admin_approved_total": "",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_PENDING_REVIEW)
+        self.assertIsNone(self.charge.admin_approved_total)
+        self.assertIsNone(self.charge.approved_by)
+        self.assertIsNone(self.charge.approved_at)
+
+    def test_admin_cannot_review_missing_charge(self):
+        self.charge.delete()
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_review",
+                "charge_review_action": "approve_as_is",
+                "admin_approved_total": "",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        self.assertFalse(MaintenanceCharge.objects.filter(maintenance_request=self.request_obj).exists())
+
+
+class MaintenanceChargeBillingPostingWorkflowTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="charge-post-admin@example.com",
+            username="chargepostadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="charge-post-staff@example.com",
+            username="chargepoststaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="charge-post-tenant@example.com",
+            username="chargeposttenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(user=self.staff, first_name="Post", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.tenant, first_name="Post", last_name="Tenant", created_by=self.admin)
+        self.unit = Unit.objects.create(number="MC-401", monthly_rent=14000, status="OCCUPIED", is_active=True)
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=14000,
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Pipe repair",
+            description="Pipe under the sink needs repair.",
+            requested_schedule_at=timezone.make_aware(datetime(2026, 7, 21, 10, 0)),
+            status="OPEN",
+            review_status="ACCEPTED",
+            assigned_staff=self.staff,
+        )
+        self.charge = MaintenanceCharge.objects.create(
+            maintenance_request=self.request_obj,
+            suggested_by=self.staff,
+            diagnosis="Pipe joint is damaged.",
+            repair_notes="Replace the connector and retighten fittings.",
+            labor_cost=Decimal("650.00"),
+            material_cost=Decimal("350.00"),
+            admin_approved_total=Decimal("1000.00"),
+            approved_by=self.admin,
+            approved_at=timezone.now(),
+            status=MaintenanceCharge.STATUS_READY_FOR_BILLING,
+        )
+
+    def _charge_url(self):
+        return reverse("admin_update_maintenance", args=[self.request_obj.id])
+
+    def test_admin_can_post_ready_for_billing_charge(self):
+        result = post_maintenance_charge_to_billing(self.charge, today=date(2026, 7, 21))
+
+        self.assertTrue(result.success)
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_ADDED_TO_BILL)
+        self.assertIsNotNone(self.charge.bill_line_item)
+        self.assertEqual(self.charge.bill_line_item.line_type, BillLineItem.LINE_TYPE_MAINTENANCE)
+        self.assertEqual(self.charge.bill_line_item.amount, Decimal("1000.00"))
+
+    def test_admin_review_flow_posts_charge_to_billing(self):
+        self.charge.status = MaintenanceCharge.STATUS_PENDING_REVIEW
+        self.charge.admin_approved_total = None
+        self.charge.approved_by = None
+        self.charge.approved_at = None
+        self.charge.save(update_fields=["status", "admin_approved_total", "approved_by", "approved_at", "updated_at"])
+        self.client.force_login(self.admin)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_review",
+                "charge_review_action": "approve_as_is",
+                "admin_approved_total": "",
+            },
+        )
+
+        self.assertRedirects(response, self._charge_url())
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_ADDED_TO_BILL)
+        self.assertEqual(self.charge.admin_approved_total, Decimal("1000.00"))
+        self.assertIsNotNone(self.charge.bill_line_item)
+
+    def test_no_charge_does_not_post_to_billing(self):
+        self.charge.status = MaintenanceCharge.STATUS_NO_CHARGE
+        self.charge.admin_approved_total = None
+        self.charge.save(update_fields=["status", "admin_approved_total", "updated_at"])
+
+        result = post_maintenance_charge_to_billing(self.charge, today=date(2026, 7, 21))
+
+        self.assertFalse(result.success)
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_NO_CHARGE)
+        self.assertIsNone(self.charge.bill_line_item)
+        self.assertFalse(BillLineItem.objects.filter(line_type=BillLineItem.LINE_TYPE_MAINTENANCE).exists())
+
+    def test_staff_cannot_post_to_billing(self):
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            self._charge_url(),
+            {
+                "form_action": "charge_post",
+            },
+        )
+
+        self.assertRedirects(response, reverse("admin_maintenance"))
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_READY_FOR_BILLING)
+        self.assertIsNone(self.charge.bill_line_item)
+
+    def test_paid_bill_is_not_modified_and_next_unpaid_bill_is_used(self):
+        self.charge.approved_at = timezone.make_aware(datetime(2026, 7, 21, 10, 0))
+        self.charge.save(update_fields=["approved_at", "updated_at"])
+        july_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 7, 1),
+            due_date=date(2026, 7, 5),
+            base_rent=Decimal("14000.00"),
+            total_due=Decimal("14000.00"),
+            status="PAID",
+        )
+        august_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 8, 1),
+            due_date=date(2026, 8, 5),
+            base_rent=Decimal("14000.00"),
+            total_due=Decimal("14000.00"),
+            status="UNPAID",
+        )
+
+        result = post_maintenance_charge_to_billing(self.charge, today=date(2026, 7, 21))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.bill, august_bill)
+        self.assertFalse(BillLineItem.objects.filter(monthly_bill=july_bill, line_type=BillLineItem.LINE_TYPE_MAINTENANCE).exists())
+        self.assertTrue(BillLineItem.objects.filter(monthly_bill=august_bill, line_type=BillLineItem.LINE_TYPE_MAINTENANCE).exists())
+
+    def test_current_or_repair_period_unpaid_bill_is_selected_not_oldest_unrelated_unpaid_bill(self):
+        self.charge.approved_at = timezone.make_aware(datetime(2026, 7, 21, 10, 0))
+        self.charge.save(update_fields=["approved_at", "updated_at"])
+        june_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 6, 1),
+            due_date=date(2026, 6, 5),
+            base_rent=Decimal("14000.00"),
+            total_due=Decimal("14000.00"),
+            status="UNPAID",
+        )
+        july_bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 7, 1),
+            due_date=date(2026, 7, 5),
+            base_rent=Decimal("14000.00"),
+            total_due=Decimal("14000.00"),
+            status="UNPAID",
+        )
+
+        result = post_maintenance_charge_to_billing(self.charge, today=date(2026, 7, 21))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.bill, july_bill)
+        self.assertFalse(BillLineItem.objects.filter(monthly_bill=june_bill, line_type=BillLineItem.LINE_TYPE_MAINTENANCE).exists())
+
+    def test_multiple_charges_in_same_bill_aggregate_into_one_maintenance_line(self):
+        result_one = post_maintenance_charge_to_billing(self.charge, today=date(2026, 7, 21))
+        self.assertTrue(result_one.success)
+
+        second_request = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="STRUCTURAL",
+            title="Door hinge repair",
+            description="Fix the hinge.",
+            requested_schedule_at=timezone.make_aware(datetime(2026, 7, 25, 9, 0)),
+            status="OPEN",
+            review_status="ACCEPTED",
+            assigned_staff=self.staff,
+        )
+        second_charge = MaintenanceCharge.objects.create(
+            maintenance_request=second_request,
+            suggested_by=self.staff,
+            diagnosis="Hinge replacement needed.",
+            repair_notes="Replace hinge and align door.",
+            labor_cost=Decimal("300.00"),
+            material_cost=Decimal("200.00"),
+            admin_approved_total=Decimal("500.00"),
+            approved_by=self.admin,
+            approved_at=timezone.now(),
+            status=MaintenanceCharge.STATUS_READY_FOR_BILLING,
+        )
+
+        result_two = post_maintenance_charge_to_billing(second_charge, today=date(2026, 7, 25))
+
+        self.assertTrue(result_two.success)
+        self.assertEqual(result_one.bill_line_item, result_two.bill_line_item)
+        result_two.bill_line_item.refresh_from_db()
+        self.assertEqual(result_two.bill_line_item.amount, Decimal("1500.00"))
+        self.assertEqual(
+            BillLineItem.objects.filter(monthly_bill=result_one.bill, line_type=BillLineItem.LINE_TYPE_MAINTENANCE).count(),
+            1,
+        )
+
+    def test_no_active_lease_keeps_charge_ready_for_billing(self):
+        self.lease.status = Lease.STATUS_TERMINATED
+        self.lease.is_active = False
+        self.lease.save(update_fields=["status", "is_active"])
+
+        result = post_maintenance_charge_to_billing(self.charge, today=date(2026, 7, 21))
+
+        self.assertFalse(result.success)
+        self.charge.refresh_from_db()
+        self.assertEqual(self.charge.status, MaintenanceCharge.STATUS_READY_FOR_BILLING)
+        self.assertIsNone(self.charge.bill_line_item)
+        self.assertFalse(BillLineItem.objects.filter(line_type=BillLineItem.LINE_TYPE_MAINTENANCE).exists())
+
+
+class MaintenanceChargeModelTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="charge-admin@example.com",
+            username="chargeadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="charge-staff@example.com",
+            username="chargestaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="charge-tenant@example.com",
+            username="chargetenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(user=self.staff, first_name="Charge", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.tenant, first_name="Charge", last_name="Tenant", created_by=self.admin)
+        self.unit = Unit.objects.create(number="MC-101", monthly_rent=10000, status="OCCUPIED", is_active=True)
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=10000,
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Broken pipe",
+            description="Water leaking from the kitchen pipe.",
+        )
+
+    def test_maintenance_charge_can_be_created_for_request(self):
+        charge = MaintenanceCharge.objects.create(
+            maintenance_request=self.request_obj,
+            suggested_by=self.staff,
+            diagnosis="Pipe seal worn out.",
+            repair_notes="Replaced seal and tightened fittings.",
+            labor_cost=Decimal("500.00"),
+            material_cost=Decimal("250.00"),
+        )
+
+        self.assertEqual(charge.maintenance_request, self.request_obj)
+        self.assertEqual(charge.status, MaintenanceCharge.STATUS_PENDING_REVIEW)
+        self.assertIsNone(charge.bill_line_item)
+        self.assertIsNone(charge.admin_approved_total)
+
+    def test_suggested_total_is_computed_from_labor_and_material_cost(self):
+        charge = MaintenanceCharge.objects.create(
+            maintenance_request=self.request_obj,
+            suggested_by=self.staff,
+            labor_cost=Decimal("1250.40"),
+            material_cost=Decimal("349.60"),
+            suggested_total=Decimal("1.00"),
+        )
+
+        self.assertEqual(charge.suggested_total, Decimal("1600.00"))
+
+    def test_only_one_maintenance_charge_can_exist_per_request(self):
+        MaintenanceCharge.objects.create(
+            maintenance_request=self.request_obj,
+            suggested_by=self.staff,
+            labor_cost=Decimal("100.00"),
+            material_cost=Decimal("50.00"),
+        )
+
+        with self.assertRaises(IntegrityError):
+            MaintenanceCharge.objects.create(
+                maintenance_request=self.request_obj,
+                suggested_by=self.staff,
+                labor_cost=Decimal("80.00"),
+                material_cost=Decimal("20.00"),
+            )
+
+    def test_bill_line_item_accepts_maintenance_line_type(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 6, 1),
+            due_date=date(2026, 6, 5),
+            base_rent=Decimal("10000.00"),
+            total_due=Decimal("10000.00"),
+            status="UNPAID",
+        )
+
+        line_item = BillLineItem.objects.create(
+            monthly_bill=bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("750.00"),
+        )
+
+        self.assertEqual(line_item.line_type, BillLineItem.LINE_TYPE_MAINTENANCE)
+        self.assertEqual(line_item.status, BillLineItem.STATUS_UNPAID)
+
+
+class StaffAssignmentAvailabilityTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="staff-availability-admin@example.com",
+            username="staffavailabilityadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.active_staff = User.objects.create_user(
+            email="available-staff@example.com",
+            username="availablestaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.inactive_staff = User.objects.create_user(
+            email="inactive-staff@example.com",
+            username="inactivestaff",
+            password="password123",
+            role=User.Role.STAFF,
+            is_active=False,
+        )
+        self.tenant = User.objects.create_user(
+            email="availability-tenant@example.com",
+            username="availabilitytenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(user=self.active_staff, first_name="Available", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.inactive_staff, first_name="Inactive", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.tenant, first_name="Tenant", last_name="User", created_by=self.admin)
+        self.unit = Unit.objects.create(number="MS-101", monthly_rent=Decimal("10000.00"), status="OCCUPIED", is_active=True)
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Pipe leak",
+            description="Water is leaking under the kitchen sink.",
+            requested_schedule_at=timezone.make_aware(datetime(2026, 6, 20, 9, 0)),
+            status="OPEN",
+            review_status="PENDING",
+        )
+
+    def test_assignment_dropdown_shows_only_active_staff_with_job_counts(self):
+        MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="ELECTRICAL",
+            title="Outlet problem",
+            description="The outlet is not working.",
+            review_status="ACCEPTED",
+            assigned_staff=self.active_staff,
+            status="OPEN",
+        )
+
+        form = AdminMaintenanceUpdateForm(instance=self.request_obj)
+        staff_queryset = form.fields["assigned_staff"].queryset
+        staff_ids = list(staff_queryset.values_list("id", flat=True))
+        labels = [form.fields["assigned_staff"].label_from_instance(obj) for obj in staff_queryset]
+
+        self.assertIn(self.active_staff.id, staff_ids)
+        self.assertNotIn(self.inactive_staff.id, staff_ids)
+        self.assertTrue(any("1 active job" in label for label in labels))
+
+    def test_existing_inactive_assigned_staff_remains_visible_in_assignment_dropdown(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.inactive_staff
+        self.request_obj.status = "OPEN"
+        self.request_obj.save(update_fields=["review_status", "assigned_staff", "status"])
+
+        form = AdminMaintenanceUpdateForm(instance=self.request_obj)
+        staff_ids = list(form.fields["assigned_staff"].queryset.values_list("id", flat=True))
+
+        self.assertIn(self.inactive_staff.id, staff_ids)
+
+    def test_staff_history_page_preserves_existing_records_after_deactivation(self):
+        self.request_obj.review_status = "ACCEPTED"
+        self.request_obj.assigned_staff = self.inactive_staff
+        self.request_obj.status = "RESOLVED"
+        self.request_obj.resolved_at = timezone.now()
+        self.request_obj.save(update_fields=["review_status", "assigned_staff", "status", "resolved_at"])
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_staff_detail", args=[self.inactive_staff.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Pipe leak")
+        self.assertContains(response, "Resolved")
+
+
+class MaintenanceSupplyOrderTrackingTests(TestCase):
+    """The delivery tracker must remain scoped to the assigned staff member."""
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            email="supply-admin@example.com",
+            username="supplyadmin",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.staff = User.objects.create_user(
+            email="supply-staff@example.com",
+            username="supplystaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.other_staff = User.objects.create_user(
+            email="other-supply-staff@example.com",
+            username="othersupplystaff",
+            password="password123",
+            role=User.Role.STAFF,
+        )
+        self.tenant = User.objects.create_user(
+            email="supply-tenant@example.com",
+            username="supplytenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(user=self.staff, first_name="Supply", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.other_staff, first_name="Other", last_name="Staff", created_by=self.admin)
+        TenantProfile.objects.create(user=self.tenant, first_name="Supply", last_name="Tenant", created_by=self.admin)
+        self.unit = Unit.objects.create(number="SO-101", monthly_rent=Decimal("10000.00"), status="OCCUPIED", is_active=True)
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.request_obj = MaintenanceRequest.objects.create(
+            tenant=self.tenant,
+            lease=self.lease,
+            category="PLUMBING",
+            title="Pipe leak",
+            description="Water is leaking under the kitchen sink.",
+            review_status="ACCEPTED",
+            assigned_staff=self.staff,
+            status="OPEN",
+        )
+
+    def _link_url(self):
+        return reverse("admin_link_maintenance_supply_order", args=[self.request_obj.id])
+
+    @patch("accounts.admin_maintenance_views.refresh_delivery_status", return_value=True)
+    def test_assigned_staff_can_link_a_builtasupply_order(self, refresh_status):
+        self.client.force_login(self.staff)
+
+        response = self.client.post(self._link_url(), {"order_number": "bs-20261114-000001"})
+
+        self.assertRedirects(response, reverse("admin_update_maintenance", args=[self.request_obj.id]))
+        supply_order = MaintenanceSupplyOrder.objects.get(maintenance_request=self.request_obj)
+        self.assertEqual(supply_order.order_number, "BS-20261114-000001")
+        self.assertEqual(supply_order.linked_by, self.staff)
+        refresh_status.assert_called_once_with(supply_order)
+
+    def test_other_staff_cannot_link_an_order_to_a_guessed_request_url(self):
+        self.client.force_login(self.other_staff)
+
+        response = self.client.post(self._link_url(), {"order_number": "BS-20261114-000001"})
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(MaintenanceSupplyOrder.objects.exists())
+
+    def test_admin_can_view_delivery_status_but_cannot_link_an_order(self):
+        MaintenanceSupplyOrder.objects.create(
+            maintenance_request=self.request_obj,
+            order_number="BS-20261114-000001",
+            delivery_status="SHIPPED",
+            linked_by=self.staff,
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse("admin_update_maintenance", args=[self.request_obj.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "BUILTASUPPLY delivery")
+        self.assertContains(response, "Shipped")

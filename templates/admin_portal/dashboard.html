@@ -1,0 +1,549 @@
+{% extends "admin_portal/base.html" %}
+{% load humanize %}
+{% block title %}Home | RealEstate360+{% endblock %}
+
+{% block content %}
+<style>
+  .dashboard-amount-full {
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    line-height: 1.1;
+    word-break: break-word;
+  }
+</style>
+<div class="dashboard-wrapper max-w-7xl mx-auto font-sans text-slate-900 space-y-8 pb-12 overflow-x-hidden w-full max-w-full">
+  
+  <!-- Top Title & Navigation Header -->
+  <header class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+    <div>
+      <div class="flex items-center gap-2 mb-1">
+        <span class="inline-block w-3 h-3 rounded-full bg-emerald-600"></span>
+        <span class="text-sm font-semibold text-slate-700">{% if is_staff_portal %}Staff Overview{% else %}System Overview{% endif %}</span>
+      </div>
+      <h1 class="text-3xl md:text-4xl font-extrabold tracking-tight text-slate-900 mt-1">Dashboard</h1>
+      <p class="text-base text-slate-700 mt-1 leading-relaxed">{% if is_staff_portal %}A focused view of maintenance work and staff notifications.{% else %}A quick look at your properties, tenants, and bills.{% endif %}</p>
+    </div>
+    
+    <div class="flex items-center gap-3 w-full md:w-auto">
+      <a href="{% url 'admin_notifications' %}" class="inline-flex items-center gap-2 px-5 py-3 bg-slate-50 hover:bg-slate-100 border border-slate-300 rounded-lg text-sm font-bold text-slate-800 transition-colors w-full md:w-auto justify-center relative">
+        <svg class="w-5 h-5 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"></path>
+        </svg>
+        <span>Notifications</span>
+        {% if unread_count > 0 %}
+          <span class="bg-rose-600 text-white text-xs font-black px-2 py-0.5 rounded-full ml-1">{{ unread_count }}</span>
+        {% endif %}
+      </a>
+      
+    </div>
+  </header>
+
+  {% if is_staff_portal %}
+  <section class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-rose-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-sm font-bold text-slate-500 uppercase tracking-tight">Assigned Task</span>
+        <div class="text-3xl font-black text-slate-900 tracking-tight">{{ assigned_task_count|intcomma }}</div>
+      </div>
+      <div class="text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-rose-600 font-bold">&bull;</span> Tasks currently assigned and waiting for action
+      </div>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-amber-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-sm font-bold text-slate-500 uppercase tracking-tight">In Progress</span>
+        <div class="text-3xl font-black text-slate-900 tracking-tight">{{ staff_in_progress_count|intcomma }}</div>
+      </div>
+      <div class="text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-amber-600 font-bold">&bull;</span> Tasks you already marked as in progress
+      </div>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-emerald-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 transition-all duration-300">
+      <div>
+        <span class="text-sm font-bold text-slate-500 uppercase tracking-tight">Resolved</span>
+        <div class="text-3xl font-black text-slate-900 tracking-tight">{{ resolved_task_count|intcomma }}</div>
+      </div>
+      <div class="text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-emerald-600 font-bold">&bull;</span> Tasks you have already resolved
+      </div>
+    </div>
+  </section>
+
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+    <div class="lg:col-span-2 space-y-6">
+      <section class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
+        <div class="mb-4 pb-3 border-b border-slate-100">
+          <h2 class="text-xl font-bold text-slate-900">Quick Access</h2>
+          <p class="text-sm text-slate-600 mt-1">Staff can work only on the daily operational modules shown below.</p>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <a href="{% url 'admin_maintenance' %}" class="rounded-xl border border-slate-200 bg-slate-50 hover:bg-white hover:border-slate-300 p-5 transition-all">
+            <p class="text-xs font-black uppercase tracking-wider text-slate-500">Maintenance</p>
+            <h3 class="mt-2 text-lg font-black text-slate-900">Review Repair Requests</h3>
+            <p class="mt-2 text-sm text-slate-600">Open submitted issues, update status, and coordinate progress.</p>
+          </a>
+          <a href="{% url 'admin_notifications' %}" class="rounded-xl border border-slate-200 bg-slate-50 hover:bg-white hover:border-slate-300 p-5 transition-all">
+            <p class="text-xs font-black uppercase tracking-wider text-slate-500">Notifications</p>
+            <h3 class="mt-2 text-lg font-black text-slate-900">Recent updates</h3>
+            <p class="mt-2 text-sm text-slate-600">Keep up with payments, maintenance, and changes across your properties.</p>
+          </a>
+        </div>
+      </section>
+    </div>
+
+    <div class="space-y-8">
+      <!-- Recent Notifications List -->
+      <div class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col max-h-[460px]">
+        <div class="flex justify-between items-center mb-4 pb-3 border-b border-slate-100 shrink-0">
+          <h3 class="text-lg font-bold text-slate-900">Notifications</h3>
+          <a href="{% url 'admin_notifications' %}" class="text-sm font-bold text-slate-800 hover:text-slate-900 underline">View All</a>
+        </div>
+        <div class="space-y-4 overflow-y-auto pr-1 flex-1">
+          {% for notification in notifications %}
+            <div class="p-4 rounded-lg border transition-colors {% if not notification.is_read %}bg-slate-50 border-slate-300 border-l-4 border-l-slate-800{% else %}bg-white border-slate-200{% endif %}">
+              <div class="mb-1">
+                <span class="text-sm font-bold text-slate-900 block leading-snug break-words">{{ notification.title }}</span>
+                <span class="text-xs text-slate-500 font-semibold block mt-0.5">{{ notification.created_at|timesince }} ago</span>
+              </div>
+              <p class="text-sm text-slate-700 leading-relaxed mt-1.5 line-clamp-2 break-words">{{ notification.message }}</p>
+            </div>
+          {% empty %}
+            <div class="text-center py-10 text-slate-500">
+              <p class="text-sm font-semibold">No notifications yet.</p>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+  {% else %}
+  <!-- Key Metrics Counters (Highly Readable & High Contrast) -->
+  <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+    
+    <a href="{% url 'admin_tenants' %}" aria-label="View tenants" class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-blue-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 hover:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-all duration-300">
+      <div>
+        <span class="text-sm font-bold text-slate-500 uppercase tracking-tight">Active Tenants</span>
+        <div class="text-3xl font-black text-slate-900 tracking-tight">{{ total_tenants|intcomma }}<span class="text-xl text-slate-400 font-medium"> / {{ total_units }}</span></div>
+      </div>
+      <div class="text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-blue-600 font-bold">&bull;</span> {{ available_units|default:vacant_units }} slots available
+      </div>
+    </a>
+
+    <!-- Available Units -->
+    <a href="{% url 'admin_units' %}" aria-label="View units" class="bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-purple-600 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 hover:border-purple-400 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 transition-all duration-300">
+      <div>
+        <span class="text-sm font-bold text-slate-500 uppercase tracking-tight">Empty Units</span>
+        <div class="text-3xl font-black text-slate-900 tracking-tight">{{ available_units|intcomma }}<span class="text-xl text-slate-400 font-medium"> / {{ total_units }}</span></div>
+      </div>
+      <div class="text-sm text-slate-600 mt-2 font-medium flex items-center gap-1.5">
+        <span class="text-purple-600 font-bold">&bull;</span> Ready for intake
+      </div>
+    </a>
+
+    <!-- Rent Collection Status -->
+    <a href="{% url 'admin_billed_this_month' %}?month={{ current_month_str }}" class="relative bg-white border border-slate-200 rounded-xl p-5 shadow-xs border-l-4 border-l-slate-700 flex flex-col justify-between hover:shadow-md hover:-translate-y-1 hover:border-slate-400 transition-all duration-300 group">
+      <div class="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 w-max px-4 py-2 bg-slate-900 text-white text-xs font-bold rounded-lg opacity-0 invisible group-hover:visible group-hover:opacity-100 transition-all duration-300 delay-500 pointer-events-none z-10 shadow-xl border border-slate-700">
+        <strong class="text-indigo-400">Click to view full billing details</strong>
+        <div class="absolute top-full left-1/2 -translate-x-1/2 border-[6px] border-transparent border-t-slate-900"></div>
+      </div>
+      <div>
+        <span class="text-sm font-bold text-slate-500 uppercase tracking-tight">Collected This Month</span>
+        <div class="mt-1 space-y-1">
+          <div class="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight dashboard-amount-full" title="PHP {{ total_collected|floatformat:0|intcomma }}">
+            PHP {{ total_collected|floatformat:0|intcomma }}
+          </div>
+          <div class="text-sm text-slate-500 font-medium">Rent Target: PHP {{ expected_monthly_rent|floatformat:0|intcomma }}</div>
+        </div>
+      </div>
+      <div class="mt-3">
+        <div class="flex items-center justify-between text-xs mb-1">
+          <span class="text-slate-600 font-medium">Collection Rate</span>
+          <span class="font-bold {% if collection_rate >= 90 %}text-emerald-600{% elif collection_rate >= 70 %}text-amber-600{% else %}text-rose-600{% endif %}">{{ collection_rate|floatformat:0 }}%</span>
+        </div>
+        <div class="w-full bg-slate-200 rounded-full h-2">
+          <div class="{% if collection_rate >= 90 %}bg-emerald-500{% elif collection_rate >= 70 %}bg-amber-500{% else %}bg-rose-500{% endif %} h-2 rounded-full transition-all" style="width: {{ collection_rate|floatformat:0 }}%"></div>
+        </div>
+      </div>
+    </a>
+
+  </section>
+
+  <!-- Main Grid Workspace -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+    
+    <!-- Left Workspace Column (2 span) -->
+    <div class="lg:col-span-2 space-y-8">
+
+      <!-- Shared filter for all trend charts -->
+      <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+        <div>
+          <h2 class="text-xl font-bold text-slate-900">Reports</h2>
+          <p class="text-sm text-slate-600 mt-0.5">Revenue, water usage, and repairs all in one place.</p>
+        </div>
+        <select id="monthFilter" class="bg-slate-50 border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-slate-500 focus:border-slate-500 block p-2.5 font-bold w-full sm:w-auto">
+          <option value="12">Past 12 Months</option>
+          <option value="6">Past 6 Months</option>
+          <option value="3">Past 3 Months</option>
+        </select>
+      </div>
+
+      <!-- Tab Buttons -->
+      <div class="flex space-x-2 border-b border-slate-200 pb-2 overflow-x-auto">
+        <button onclick="showReportTab('income')" id="tab-income" class="px-4 py-2 text-sm font-bold rounded-lg bg-indigo-50 text-indigo-700 border border-indigo-200 transition-colors whitespace-nowrap">Income</button>
+        <button onclick="showReportTab('water')" id="tab-water" class="px-4 py-2 text-sm font-bold rounded-lg bg-white text-slate-600 hover:bg-slate-50 border border-transparent transition-colors whitespace-nowrap">Water Usage</button>
+        <button onclick="showReportTab('repairs')" id="tab-repairs" class="px-4 py-2 text-sm font-bold rounded-lg bg-white text-slate-600 hover:bg-slate-50 border border-transparent transition-colors whitespace-nowrap">Repairs</button>
+      </div>
+
+      <!-- Reports Container -->
+      <div class="relative">
+        <!-- Revenue Performance line chart -->
+        <div id="report-income" class="report-section bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
+          <div class="mb-4 pb-3 border-b border-slate-100">
+            <h3 class="text-lg font-bold text-slate-900">Income Over Time</h3>
+            <p class="text-sm text-slate-700 mt-0.5">This shows how much money was collected compared to what was expected. The table below lists the exact numbers.</p>
+          </div>
+          <div id="rentTableContainer" class="mb-6 overflow-x-auto max-h-[250px] overflow-y-auto"></div>
+          <div class="h-[300px] w-full">
+            <canvas id="rentChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Water Usage line chart -->
+        <div id="report-water" class="report-section bg-white border border-slate-200 rounded-xl p-6 shadow-xs hidden">
+          <div class="flex justify-between items-center mb-4 pb-3 border-b border-slate-100">
+            <div>
+              <h2 class="text-lg font-extrabold text-slate-900 tracking-tight">Water Usage</h2>
+              <p class="text-sm text-slate-700 mt-0.5">This tracks the total water used across all units. Use the table to see the exact cubic meters used.</p>
+            </div>
+            <span class="text-xs font-bold text-slate-700 bg-slate-100 px-2 py-1 rounded">m3</span>
+          </div>
+          <div id="waterTableContainer" class="mb-6 overflow-x-auto max-h-[250px] overflow-y-auto"></div>
+          <div class="h-[300px] w-full">
+            <canvas id="waterChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Maintenance Trend bar chart -->
+        <div id="report-repairs" class="report-section bg-white border border-slate-200 rounded-xl p-6 shadow-xs hidden">
+          <div class="flex justify-between items-center mb-4 pb-3 border-b border-slate-100">
+            <div>
+              <h3 class="font-bold text-slate-900">Repair History</h3>
+              <p class="text-sm text-slate-500 mt-1">This shows the number of repair requests made by tenants each month.</p>
+            </div>
+            <span class="text-xs font-bold text-slate-700 bg-slate-100 px-2 py-1 rounded">repairs</span>
+          </div>
+          <div id="maintenanceTableContainer" class="mb-6 overflow-x-auto max-h-[250px] overflow-y-auto"></div>
+          <div class="h-[300px] w-full">
+            <canvas id="maintenanceChart"></canvas>
+          </div>
+        </div>
+      </div>
+
+
+
+    </div>
+
+    <!-- Right Feed Column (1 span) -->
+    <div class="space-y-8">
+      
+      <!-- Recent Notifications List -->
+      <div class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col max-h-[460px]">
+        <div class="flex justify-between items-center mb-4 pb-3 border-b border-slate-100 shrink-0">
+          <h3 class="text-lg font-bold text-slate-900">Notifications</h3>
+          <a href="{% url 'admin_notifications' %}" class="text-sm font-bold text-slate-800 hover:text-slate-900 underline">View All</a>
+        </div>
+        
+        <div class="space-y-4 overflow-y-auto pr-1 flex-1">
+          {% for notification in notifications %}
+            <div class="p-4 rounded-lg border transition-colors {% if not notification.is_read %}bg-slate-50 border-slate-300 border-l-4 border-l-slate-800{% else %}bg-white border-slate-200{% endif %}">
+              <div class="mb-1">
+                <span class="text-sm font-bold text-slate-900 block leading-snug break-words">{{ notification.title }}</span>
+                <span class="text-xs text-slate-500 font-semibold block mt-0.5">{{ notification.created_at|timesince }} ago</span>
+              </div>
+              <p class="text-sm text-slate-700 leading-relaxed mt-1.5 line-clamp-2 break-words">{{ notification.message }}</p>
+            </div>
+          {% empty %}
+            <div class="text-center py-10 text-slate-500">
+              <p class="text-sm font-semibold">No notifications yet.</p>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+  {% endif %}</div>
+
+</div>
+
+<!-- Data pass-through for JS Chart Rendering -->
+{{ monthly_income_data|json_script:"monthly_income_data" }}
+{{ water_usage_data|json_script:"water_usage_data" }}
+{{ maintenance_trend_data|json_script:"maintenance_trend_data" }}
+{{ months_labels|json_script:"months_labels" }}
+
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    const rentCtx = document.getElementById('rentChart');
+    const waterCtx = document.getElementById('waterChart');
+    const maintenanceCtx = document.getElementById('maintenanceChart');
+    if (!rentCtx || !waterCtx || !maintenanceCtx) return;
+
+    const monthlyIncomeDataElement = document.getElementById('monthly_income_data');
+    const waterUsageDataElement = document.getElementById('water_usage_data');
+    const maintenanceTrendDataElement = document.getElementById('maintenance_trend_data');
+    const monthsLabelsElement = document.getElementById('months_labels');
+    const monthFilter = document.getElementById('monthFilter');
+
+    if (!monthlyIncomeDataElement || !waterUsageDataElement || !maintenanceTrendDataElement || !monthsLabelsElement || !monthFilter) return;
+
+    const fullMonthlyData = JSON.parse(monthlyIncomeDataElement.textContent);
+    const fullWaterData = JSON.parse(waterUsageDataElement.textContent);
+    const fullMaintenanceData = JSON.parse(maintenanceTrendDataElement.textContent);
+    const fullMonthsLabels = JSON.parse(monthsLabelsElement.textContent);
+
+    function getFilteredSeries(data, monthsToShow) {
+      const endIndex = data.length;
+      const startIndex = Math.max(0, endIndex - monthsToShow);
+      return data.slice(startIndex, endIndex);
+    }
+
+    function getFilteredLabels(monthsToShow) {
+      const endIndex = fullMonthsLabels.length;
+      const startIndex = Math.max(0, endIndex - monthsToShow);
+      return fullMonthsLabels.slice(startIndex, endIndex);
+    }
+
+    function baseOptions(tickCallback) {
+      return {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: true,
+            position: 'top',
+            align: 'end',
+            labels: {
+              usePointStyle: true,
+              padding: 16,
+              font: {
+                family: "'Outfit', sans-serif",
+                size: 13,
+                weight: '700'
+              },
+              color: '#1e293b'
+            }
+          },
+          tooltip: {
+            backgroundColor: '#0f172a',
+            titleColor: '#f8fafc',
+            bodyColor: '#e2e8f0',
+            borderColor: '#334155',
+            borderWidth: 1,
+            padding: 12,
+            boxPadding: 6,
+            titleFont: { size: 13, weight: 'bold' },
+            bodyFont: { size: 13 },
+            usePointStyle: true
+          }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            grid: {
+              display: true,
+              color: '#f1f5f9',
+              drawBorder: false
+            },
+            ticks: {
+              font: { family: "'Outfit', sans-serif", size: 12, weight: '600' },
+              color: '#475569',
+              callback: tickCallback
+            }
+          },
+          x: {
+            grid: { display: false },
+            ticks: {
+              font: { family: "'Outfit', sans-serif", size: 12, weight: '600' },
+              color: '#475569'
+            }
+          }
+        }
+      };
+    }
+
+    function generateTableHTML(labels, datasetLabels, datasets) {
+      let html = '<table class="w-full text-left text-sm text-slate-600 border-collapse border border-slate-200"><thead><tr class="bg-slate-50 border-b border-slate-200">';
+      html += '<th class="px-3 py-2 font-bold text-slate-700 border-r border-slate-200">Month</th>';
+      for (let label of datasetLabels) {
+        html += `<th class="px-3 py-2 font-bold text-slate-700 border-r border-slate-200">${label}</th>`;
+      }
+      html += '</tr></thead><tbody>';
+      
+      for (let i = 0; i < labels.length; i++) {
+        html += '<tr class="border-b border-slate-200">';
+        html += `<td class="px-3 py-1.5 border-r border-slate-200">${labels[i]}</td>`;
+        for (let dataset of datasets) {
+          let val = dataset.data[i];
+          if (dataset.isCurrency) {
+            val = '₱' + Number(val).toLocaleString();
+          } else if (dataset.isWater) {
+            val = val + ' m³';
+          }
+          html += `<td class="px-3 py-1.5 border-r border-slate-200">${val}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function updateCharts(monthsToShow) {
+      const filteredRevenueData = getFilteredSeries(fullMonthlyData, monthsToShow);
+      const filteredWaterData = getFilteredSeries(fullWaterData, monthsToShow);
+      const filteredMaintenanceData = getFilteredSeries(fullMaintenanceData, monthsToShow);
+      const filteredLabels = getFilteredLabels(monthsToShow);
+
+      // Render Tables
+      document.getElementById('rentTableContainer').innerHTML = generateTableHTML(
+        filteredLabels, 
+        ['Actual Income', 'Expected Rent'], 
+        [
+          { data: filteredRevenueData.map(item => item.actual), isCurrency: true },
+          { data: filteredRevenueData.map(item => item.expected), isCurrency: true }
+        ]
+      );
+
+      document.getElementById('waterTableContainer').innerHTML = generateTableHTML(
+        filteredLabels, 
+        ['Water Used'], 
+        [{ data: filteredWaterData.map(item => item.consumption), isWater: true }]
+      );
+
+      document.getElementById('maintenanceTableContainer').innerHTML = generateTableHTML(
+        filteredLabels, 
+        ['Repairs'], 
+        [{ data: filteredMaintenanceData.map(item => item.count) }]
+      );
+
+      const chartData = {
+        labels: filteredLabels,
+        datasets: [{
+          label: 'Actual Income',
+          data: filteredRevenueData.map(item => item.actual),
+          borderColor: '#1e293b',
+          backgroundColor: 'rgba(30, 41, 59, 0.05)',
+          borderWidth: 3,
+          pointBackgroundColor: '#fff',
+          pointBorderColor: '#1e293b',
+          pointBorderWidth: 2.5,
+          pointRadius: 5,
+          pointHoverRadius: 7,
+          tension: 0.25,
+          fill: true
+        }, {
+          label: 'Expected Rent',
+          data: filteredRevenueData.map(item => item.expected),
+          borderColor: '#64748b',
+          backgroundColor: 'transparent',
+          borderWidth: 2,
+          borderDash: [5, 5],
+          pointRadius: 0,
+          tension: 0.25,
+          fill: false
+        }]
+      };
+
+      const existingChart = Chart.getChart(rentCtx);
+      if (existingChart) existingChart.destroy();
+
+      new Chart(rentCtx, {
+        type: 'line',
+        data: chartData,
+        options: baseOptions(function (value) {
+          if (value >= 1000) return '₱' + (value / 1000) + 'k';
+          return '₱' + value;
+        })
+      });
+
+      const existingWaterChart = Chart.getChart(waterCtx);
+      if (existingWaterChart) existingWaterChart.destroy();
+
+      new Chart(waterCtx, {
+        type: 'line',
+        data: {
+          labels: filteredLabels,
+          datasets: [{
+            label: 'Water Used',
+            data: filteredWaterData.map(item => item.consumption),
+            borderColor: '#0f766e',
+            backgroundColor: 'rgba(15, 118, 110, 0.08)',
+            borderWidth: 3,
+            pointBackgroundColor: '#fff',
+            pointBorderColor: '#0f766e',
+            pointBorderWidth: 2.5,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            tension: 0.25,
+            fill: true
+          }]
+        },
+        options: baseOptions(function (value) {
+          return value + ' m³';
+        })
+      });
+
+      const existingMaintenanceChart = Chart.getChart(maintenanceCtx);
+      if (existingMaintenanceChart) existingMaintenanceChart.destroy();
+
+      new Chart(maintenanceCtx, {
+        type: 'bar',
+        data: {
+          labels: filteredLabels,
+          datasets: [{
+            label: 'Repairs',
+            data: filteredMaintenanceData.map(item => item.count),
+            backgroundColor: 'rgba(124, 58, 237, 0.16)',
+            borderColor: '#7c3aed',
+            borderWidth: 2,
+            borderRadius: 6
+          }]
+        },
+        options: baseOptions(function (value) {
+          return value;
+        })
+      });
+    }
+
+    updateCharts(12);
+    monthFilter.addEventListener('change', (e) => updateCharts(parseInt(e.target.value)));
+  });
+</script>
+
+<script>
+function showReportTab(tabId) {
+  // Hide all report sections
+  document.querySelectorAll('.report-section').forEach(el => el.classList.add('hidden'));
+  
+  // Show target report section
+  document.getElementById('report-' + tabId).classList.remove('hidden');
+  
+  // Reset all tabs to inactive state
+  const tabs = ['income', 'water', 'repairs'];
+  tabs.forEach(t => {
+    const btn = document.getElementById('tab-' + t);
+    btn.className = 'px-4 py-2 text-sm font-bold rounded-lg whitespace-nowrap transition-colors bg-white text-slate-600 hover:bg-slate-50 border border-transparent';
+  });
+  
+  // Set active tab styling
+  const activeBtn = document.getElementById('tab-' + tabId);
+  activeBtn.className = 'px-4 py-2 text-sm font-bold rounded-lg whitespace-nowrap transition-colors bg-indigo-50 text-indigo-700 border border-indigo-200';
+}
+</script>
+
+{% endblock %}

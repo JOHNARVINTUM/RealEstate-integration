@@ -1,0 +1,42 @@
+{% extends "admin_portal/base.html" %}
+{% load static %}
+{% block title %}Landing Page Editor | Real Estate Administration{% endblock %}
+
+{% block extra_head %}
+  <link rel="stylesheet" href="{% static 'css/landing.css' %}?v={% now 'U' %}">
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto px-2 sm:px-4 lg:px-6 py-6 sm:py-8 space-y-6">
+  <header class="bg-white border border-slate-200 rounded-2xl p-6 lg:p-8 shadow-sm flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6">
+    <div>
+      <div class="flex items-center gap-3 mb-2">
+        <div class="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-700 shadow-sm border border-slate-200">
+          <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 6h16M4 12h16M4 18h10"></path></svg>
+        </div>
+        <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 leading-tight">Landing Page Editor</h1>
+      </div>
+      <p class="text-sm text-slate-500 mt-1">Preview the live landing page structure and edit each fixed section without changing the design.</p>
+    </div>
+    <div class="grid grid-cols-2 gap-3 w-full sm:w-auto">
+      <div class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 min-w-[170px]">
+        <div class="text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">Banner Records</div>
+        <div class="text-2xl font-black text-slate-900 mt-2">{{ banner_count }}</div>
+      </div>
+      <div class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 min-w-[170px]">
+        <div class="text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">Content Profiles</div>
+        <div class="text-2xl font-black text-slate-900 mt-2">{{ profile_count }}</div>
+      </div>
+    </div>
+  </header>
+
+  <section class="bg-blue-50 border border-blue-100 rounded-2xl px-5 py-4 flex flex-col gap-2 text-sm text-blue-900 shadow-sm">
+    <span class="font-black uppercase tracking-[0.18em] text-[11px] text-blue-500">Content Management</span>
+    <p class="leading-6">This preview uses the same content resolution as the public landing page. Empty CMS fields automatically fall back to safe default text and images so the public page stays stable.</p>
+  </section>
+
+  <div class="cms-preview-shell rounded-[2rem] overflow-hidden border border-slate-200 bg-white shadow-sm">
+    {% include "accounts/landing_content.html" %}
+  </div>
+</div>
+{% endblock %}

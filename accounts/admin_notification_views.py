@@ -1,0 +1,231 @@
+from django.contrib import messages
+from functools import lru_cache
+import re
+
+from django.db import connection
+from django.db.models import Q
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.utils import timezone
+from django.views.decorators.http import require_POST
+
+from maintenance.models import MaintenanceRequest
+from payments.models import ManualPayment
+from rentals.models import Notification
+
+from .decorators import staff_or_admin_required
+
+
+def _admin_notification_scope(user):
+    if getattr(user, "role", "") == "STAFF":
+        return Q(recipient_type="SPECIFIC_USER", user=user)
+    return Q(recipient_type="ADMIN") | Q(recipient_type="SPECIFIC_USER", user=user)
+
+
+@lru_cache(maxsize=1)
+def notification_has_read_at_column() -> bool:
+    """Return True when the notifications table already has the read_at column."""
+    with connection.cursor() as cursor:
+        columns = connection.introspection.get_table_description(cursor, Notification._meta.db_table)
+    return any(column.name == "read_at" for column in columns)
+
+
+def resolve_notification_target_url(notification):
+    """Return the best action URL for a notification when one can be resolved safely."""
+    if notification.notification_type == "PAYMENT":
+        reference_match = re.search(
+            r"(?:Payment )?Reference:\s*([A-Za-z0-9_-]+)",
+            notification.message or "",
+            flags=re.IGNORECASE,
+        )
+        payment = None
+        if reference_match:
+            payment = ManualPayment.objects.filter(
+                reference_code=reference_match.group(1)
+            ).order_by("-created_at").first()
+        if not payment and notification.related_tenant:
+            payment_filters = {"user": notification.related_tenant}
+            if notification.title in {"Cash Payment Scheduled", "Cash payment requested"}:
+                payment_filters.update({
+                    "payment_method": "CASH",
+                    "status": "PENDING",
+                })
+            payment = ManualPayment.objects.filter(
+                **payment_filters
+            ).order_by("-created_at").first()
+        if payment:
+            notification.target_label = "View Payment" if payment.status == "APPROVED" or payment.payment_method == "PAYMONGO" else "Approve Payment"
+            return reverse("admin_payment_detail", args=[payment.id])
+        notification.target_label = "Approve Payment"
+        return f"{reverse('admin_payments')}?status=PENDING"
+
+    if notification.notification_type != "MAINTENANCE" or not notification.related_tenant:
+        return None
+
+    title_marker = "maintenance request:"
+    message_lower = notification.message.lower()
+    if title_marker not in message_lower:
+        return reverse("admin_maintenance")
+
+    marker_index = message_lower.rfind(title_marker)
+    request_title = notification.message[marker_index + len(title_marker):].strip().rstrip(".")
+    if not request_title:
+        return reverse("admin_maintenance")
+
+    maintenance_qs = MaintenanceRequest.objects.filter(
+        tenant=notification.related_tenant,
+        title__iexact=request_title,
+    ).order_by("-created_at")
+
+    maintenance_request = maintenance_qs.first()
+    if maintenance_request:
+        return reverse("admin_update_maintenance", args=[maintenance_request.id])
+
+    return reverse("admin_maintenance")
+
+
+def purge_read_admin_notifications():
+    if not notification_has_read_at_column():
+        return 0
+    cutoff = timezone.now() - timezone.timedelta(days=1)
+    return Notification.objects.filter(
+        recipient_type__in=["ADMIN", "SPECIFIC_USER"],
+        is_read=True,
+        read_at__lt=cutoff,
+    ).delete()[0]
+
+
+@staff_or_admin_required
+def admin_notifications(request):
+    """Admin portal: view admin notifications only."""
+    purge_read_admin_notifications()
+    base_notifications = Notification.objects.filter(
+        _admin_notification_scope(request.user)
+    ).exclude(
+        notification_type="LEASE",
+        title="New Lease Created",
+    ).select_related("related_tenant__tenantprofile", "related_unit")
+    notifications = base_notifications
+
+    status_filter = request.GET.get("status", "all")
+    if status_filter == "unread":
+        notifications = notifications.filter(is_read=False)
+    elif status_filter == "read":
+        notifications = notifications.filter(is_read=True)
+
+    notifications = notifications.order_by("-created_at")
+    notification_list = list(notifications)
+    for notification in notification_list:
+        notification.target_label = None
+        notification.target_url = resolve_notification_target_url(notification)
+    unread_count = base_notifications.filter(is_read=False).count()
+
+    is_ajax = (
+        request.GET.get("format") == "json"
+        and request.headers.get("X-Requested-With") == "XMLHttpRequest"
+    )
+    if is_ajax:
+        return JsonResponse({
+            "unread_count": unread_count,
+            "notifications": [
+                {
+                    "id": n.id,
+                    "title": n.title,
+                    "message": n.message,
+                    "notification_type": n.notification_type,
+                    "is_read": n.is_read,
+                    "target_url": getattr(n, "target_url", None),
+                    "created_at": n.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "related_tenant": {
+                        "email": n.related_tenant.email if n.related_tenant else None,
+                        "name": (
+                            n.related_tenant.tenantprofile.full_name
+                            if n.related_tenant
+                            and hasattr(n.related_tenant, "tenantprofile")
+                            and n.related_tenant.tenantprofile
+                            else n.related_tenant.email if n.related_tenant else None
+                        ),
+                    } if n.related_tenant else None,
+                    "related_unit": {
+                        "number": n.related_unit.number if n.related_unit else None,
+                        "type": n.related_unit.get_unit_type_display() if n.related_unit else None,
+                    } if n.related_unit else None,
+                }
+                for n in notification_list
+            ],
+        })
+
+    return render(request, "admin_portal/notifications.html", {
+        "notifications": notification_list,
+        "unread_count": unread_count,
+        "status_filter": status_filter,
+    })
+
+
+@staff_or_admin_required
+@require_POST
+def admin_mark_notification_read(request, notification_id):
+    """Admin portal: mark notification as read."""
+    notification = get_object_or_404(
+        Notification.objects.filter(_admin_notification_scope(request.user)),
+        id=notification_id,
+    )
+    notification.is_read = True
+    if notification_has_read_at_column():
+        notification.read_at = timezone.now()
+        notification.save(update_fields=["is_read", "read_at"])
+    else:
+        notification.save(update_fields=["is_read"])
+
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return JsonResponse({"success": True})
+
+    return redirect("admin_notifications")
+
+
+@staff_or_admin_required
+@require_POST
+def admin_mark_all_notifications_read(request):
+    """Admin portal: mark all notifications as read."""
+    unread_notifications = Notification.objects.filter(
+        _admin_notification_scope(request.user),
+        is_read=False,
+    )
+    if notification_has_read_at_column():
+        unread_notifications.update(is_read=True, read_at=timezone.now())
+    else:
+        unread_notifications.update(is_read=True)
+
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return JsonResponse({"success": True})
+
+    return redirect("admin_notifications")
+
+
+@staff_or_admin_required
+def admin_delete_all_read_notifications(request):
+    """Delete all read admin notifications."""
+    if request.method != "POST":
+        return redirect("admin_notifications")
+
+    deleted_count, _ = Notification.objects.filter(
+        _admin_notification_scope(request.user),
+        is_read=True,
+    ).delete()
+    messages.success(request, f"Deleted {deleted_count} read notification{'s' if deleted_count != 1 else ''}.")
+    return redirect("admin_notifications")
+
+
+@staff_or_admin_required
+@require_POST
+def admin_delete_notification(request, notification_id):
+    """Delete a scoped notification without password reconfirmation."""
+    notification = get_object_or_404(
+        Notification.objects.filter(_admin_notification_scope(request.user)),
+        id=notification_id,
+    )
+    notification_title = notification.title
+    notification.delete()
+    messages.success(request, f"Notification '{notification_title}' has been deleted successfully.")
+    return redirect("admin_notifications")

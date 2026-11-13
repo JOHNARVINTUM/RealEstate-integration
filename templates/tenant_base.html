@@ -1,0 +1,435 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'css/ux-system.css' %}?v={% now 'U' %}">
+<link rel="stylesheet" href="{% static 'admin_portal/css/admin.css' %}?v={% now 'U' %}">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800;900&family=Inter:wght@400;500;700;800&family=MuseoModerno:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  /* Premium & Accessible Tenant Portal Styling */
+  
+  :root {
+    --tenant-primary: #0f172a;
+    --tenant-bg: #f8fafc;
+    --tenant-card-bg: #ffffff;
+    --tenant-border: #e2e8f0;
+  }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    color: #0f172a;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: 'Outfit', sans-serif;
+  }
+
+  .font-display {
+    font-family: 'MuseoModerno', sans-serif;
+  }
+  
+  /* Form Field Styling - Larger & Clearer */
+  .tenant-form select,
+  .tenant-form input[type="text"],
+  .tenant-form input[type="email"],
+  .tenant-form input[type="password"],
+  .tenant-form input[type="number"],
+  .tenant-form input[type="tel"],
+  .tenant-form textarea {
+    width: 100%;
+    border: 2px solid #e2e8f0;
+    border-radius: 1rem;
+    padding: 1rem 1.25rem;
+    background-color: #ffffff;
+    transition: all 0.2s ease;
+    font-size: 1.125rem;
+    color: #0f172a;
+    font-weight: 600;
+  }
+  
+  .tenant-form select:focus,
+  .tenant-form input[type="text"]:focus,
+  .tenant-form input[type="email"]:focus,
+  .tenant-form input[type="password"]:focus,
+  .tenant-form input[type="number"]:focus,
+  .tenant-form input[type="tel"]:focus,
+  .tenant-form textarea:focus {
+    border-color: #0f172a;
+    outline: none;
+    box-shadow: 0 0 0 4px rgba(15, 23, 42, 0.05);
+  }
+  
+  /* Form Labels - Bold & Readable */
+  .tenant-form label {
+    display: block;
+    margin-bottom: 0.75rem;
+    color: #0f172a;
+    font-size: 1.125rem;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+  }
+  
+  /* Form Buttons - Premium Feel */
+  .tenant-form button[type="submit"] {
+    background-color: #0f172a;
+    color: white;
+    border: none;
+    padding: 1.25rem 2.5rem;
+    border-radius: 1.25rem;
+    font-weight: 900;
+    font-size: 1.25rem;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    cursor: pointer;
+    box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.15);
+  }
+  
+  .tenant-form button[type="submit"]:hover {
+    background-color: #1e293b;
+    transform: translateY(-2px);
+    box-shadow: 0 20px 30px -10px rgba(15, 23, 42, 0.2);
+  }
+
+  .tenant-form button[type="submit"]:active {
+    transform: translateY(0);
+  }
+  
+  /* Messages - High Contrast */
+  .tenant-form .errorlist {
+    list-style: none;
+    padding: 0;
+    margin: 1rem 0 0 0;
+  }
+  
+  .tenant-form .errorlist li {
+    background-color: #fef2f2;
+    color: #991b1b;
+    padding: 1rem 1.25rem;
+    border-radius: 1rem;
+    font-size: 1rem;
+    font-weight: 700;
+    border-left: 6px solid #dc2626;
+  }
+  
+  .tenant-form .success-message {
+    background-color: #f0fdf4;
+    color: #166534;
+    padding: 1.25rem 1.5rem;
+    border-radius: 1rem;
+    font-size: 1.125rem;
+    font-weight: 700;
+    border-left: 6px solid #16a34a;
+    margin-bottom: 2rem;
+  }
+  
+  /* Premium Cards */
+  .tenant-card {
+    background: #ffffff;
+    border: 2px solid #f1f5f9;
+    border-radius: 2rem;
+    padding: 2.5rem;
+    box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.04);
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+  }
+
+  .tenant-page-content-hidden {
+    opacity: 0;
+  }
+
+  .tenant-skeleton {
+    border: 2px solid #f1f5f9;
+    border-radius: 2rem;
+    background: #ffffff;
+    overflow: hidden;
+    box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.04);
+  }
+
+  .tenant-skeleton-bar {
+    position: relative;
+    overflow: hidden;
+    background: #e2e8f0;
+    border-radius: 9999px;
+  }
+
+  .tenant-skeleton-bar::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.7), transparent);
+    animation: tenantSkeletonShimmer 1.5s infinite;
+  }
+
+  @keyframes tenantSkeletonShimmer {
+    100% {
+      transform: translateX(100%);
+    }
+  }
+
+  /* Readable Status Badges */
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.5rem 1rem;
+    border-radius: 0.75rem;
+    font-size: 0.875rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  
+  .tenant-sidebar {
+    background-color: #0f172a;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    height: 100vh !important;
+    z-index: 1000 !important;
+    overflow-y: auto !important;
+    overflow-x: visible !important;
+    transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s ease !important;
+  }
+
+  .tenant-sidebar .tenant-nav-list {
+    overflow: visible;
+  }
+  
+  .tenant-sidebar .nav-item {
+    min-height: 56px;
+    transition: background-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+    margin: 0.25rem 0;
+    position: relative;
+    isolation: isolate;
+    outline: none;
+  }
+  
+  .tenant-sidebar .nav-item:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+    color: #ffffff;
+    transform: translateX(2px);
+  }
+
+  .tenant-sidebar .nav-item:focus-visible {
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.35);
+  }
+  
+  .tenant-sidebar .nav-item.active {
+    background: linear-gradient(135deg, #2563eb, #3b82f6);
+    color: #ffffff;
+    box-shadow: 0 12px 24px -16px rgba(59, 130, 246, 0.75);
+  }
+
+  .tenant-sidebar .nav-item.active::before {
+    content: "";
+    position: absolute;
+    left: 0.7rem;
+    top: 50%;
+    width: 0.25rem;
+    height: 1.35rem;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.95);
+    transform: translateY(-50%);
+  }
+
+  .tenant-nav-tooltip {
+    display: none;
+  }
+
+  /* Tenant Sidebar Collapse Behavior - Desktop Only */
+  @media (min-width: 800px) {
+    body.tenant-collapsed .tenant-sidebar {
+      width: 100px !important;
+      overflow: visible !important;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .tenant-nav-list {
+      overflow: visible;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .brand-text,
+    body.tenant-collapsed .tenant-sidebar .nav-text,
+    body.tenant-collapsed .tenant-sidebar .brand-name {
+      opacity: 0;
+      width: 0;
+      display: none !important;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .brand-header {
+      justify-content: center;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .tenant-brand-logo {
+      width: 56px;
+      height: 56px;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .nav-item,
+    body.tenant-collapsed .tenant-sidebar button {
+      justify-content: center;
+      padding: 1rem 0;
+      width: 4.25rem;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .nav-item.active::before {
+      left: 0.28rem;
+      height: 1.1rem;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .nav-item svg {
+      width: 1.55rem;
+      height: 1.55rem;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .nav-item:hover {
+      transform: none;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .nav-item:hover .tenant-nav-tooltip,
+    body.tenant-collapsed .tenant-sidebar .nav-item:focus-visible .tenant-nav-tooltip {
+      display: block;
+      position: absolute;
+      left: calc(100% + 0.85rem);
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 1200;
+      width: max-content;
+      max-width: 14rem;
+      padding: 0.65rem 0.8rem;
+      border-radius: 0.85rem;
+      background: #0f172a;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      box-shadow: 0 18px 35px -18px rgba(15, 23, 42, 0.9);
+      color: #ffffff;
+      font-size: 0.78rem;
+      font-weight: 900;
+      letter-spacing: 0.02em;
+      pointer-events: none;
+    }
+
+    body.tenant-collapsed .tenant-sidebar .nav-item:hover .tenant-nav-tooltip::before,
+    body.tenant-collapsed .tenant-sidebar .nav-item:focus-visible .tenant-nav-tooltip::before {
+      content: "";
+      position: absolute;
+      right: 100%;
+      top: 50%;
+      transform: translateY(-50%);
+      border-width: 0.4rem;
+      border-style: solid;
+      border-color: transparent #0f172a transparent transparent;
+    }
+
+    body.tenant-collapsed #tenantToggleIcon {
+      transform: rotate(180deg);
+    }
+
+    body.tenant-collapsed main.flex-1 {
+      margin-left: 100px !important;
+    }
+  }
+
+  /* Background Pattern */
+  .tenant-workspace-bg {
+    background-color: #f8fafc;
+    background-image: 
+      radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.03) 0px, transparent 50%),
+      radial-gradient(at 100% 100%, rgba(99, 102, 241, 0.03) 0px, transparent 50%);
+  }
+
+  .animate-fade-in {
+    animation: fadeIn 0.5s ease-out forwards;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="min-h-screen flex flex-col min-[800px]:flex-row tenant-workspace-bg">
+
+  <!-- Mobile Header -->
+  <header class="min-[800px]:hidden flex items-center justify-between px-4 py-3 bg-white border-b border-slate-200 sticky top-0 z-50">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 bg-white rounded-lg flex justify-center items-center shadow-sm p-1">
+        <img src="{% static 'img/accounts/RealEstate360+ Logo2 jpg.jpg' %}" alt="Logo" class="w-full h-full object-contain">
+      </div>
+      <div class="text-lg font-semibold tracking-tight text-slate-900 font-display">
+        RealEstate360<span class="text-blue-500">+</span>
+      </div>
+    </div>
+    <button id="mobileMenuBtn" class="p-2 text-slate-600 hover:bg-slate-100 rounded-lg transition-colors">
+      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16m-7 6h7"/>
+      </svg>
+    </button>
+  </header>
+
+  <!-- Mobile Sidebar Backdrop -->
+  <div id="mobileBackdrop" class="fixed inset-0 bg-slate-900/50 z-[990] hidden transition-opacity opacity-0 duration-300 min-[800px]:hidden"></div>
+
+  {% include "includes/tenant_sidebar.html" %}
+
+  <main class="flex-1 min-[800px]:ml-72 px-4 py-6 min-[800px]:px-8 min-[800px]:py-10 overflow-y-auto transition-all duration-300">
+    <div class="max-w-7xl mx-auto animate-fade-in">
+      {% include "partials/toasts.html" %}
+      
+      {% block tenant_content %}{% endblock %}
+    </div>
+  </main>
+
+  {% include "partials/loader.html" %}
+
+  {% block tenant_modals %}{% endblock %}
+</div>
+
+<script src="{% static 'js/form-guard.js' %}"></script>
+<script src="{% static 'js/ux-loader.js' %}?v={% now 'U' %}"></script>
+<script src="{% static 'js/toast-system.js' %}"></script>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    const toggleBtn = document.getElementById('tenantSidebarToggle');
+    const mobileMenuBtn = document.getElementById('mobileMenuBtn');
+    const sidebar = document.getElementById('tenantSidebar');
+    const backdrop = document.getElementById('mobileBackdrop');
+
+    // Desktop Collapse Logic
+    if (toggleBtn) {
+      if (localStorage.getItem('tenantSidebarCollapsed') === 'true') {
+        document.body.classList.add('tenant-collapsed');
+      }
+
+      toggleBtn.addEventListener('click', function () {
+        document.body.classList.toggle('tenant-collapsed');
+        const isCollapsed = document.body.classList.contains('tenant-collapsed');
+        localStorage.setItem('tenantSidebarCollapsed', isCollapsed);
+      });
+    }
+
+    // Mobile Sidebar Logic
+    function toggleMobileMenu() {
+      if (sidebar.classList.contains('-translate-x-full')) {
+        // Open
+        sidebar.classList.remove('-translate-x-full');
+        backdrop.classList.remove('hidden');
+        // Small delay to allow display:block to apply before animating opacity
+        setTimeout(() => backdrop.classList.add('opacity-100'), 10);
+      } else {
+        // Close
+        sidebar.classList.add('-translate-x-full');
+        backdrop.classList.remove('opacity-100');
+        setTimeout(() => backdrop.classList.add('hidden'), 300);
+      }
+    }
+
+    if (mobileMenuBtn && sidebar && backdrop) {
+      mobileMenuBtn.addEventListener('click', toggleMobileMenu);
+      backdrop.addEventListener('click', toggleMobileMenu);
+    }
+
+  });
+</script>
+{% endblock %}

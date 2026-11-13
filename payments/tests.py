@@ -1,0 +1,549 @@
+from datetime import date
+from decimal import Decimal
+
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from io import StringIO
+from unittest.mock import patch
+
+from accounts.models import User
+from accounts.admin_payment_views import _admin_payment_queryset
+from billing.models import BillingInvoice, BillLineItem, MonthlyBill
+from payments.models import ManualPayment
+from payments.paymongo_workflow import (
+    auto_approve_paymongo_payment,
+    get_pending_paymongo_payment,
+    resolve_payment_tenant_user,
+)
+from payments.services import should_relabel_full_payment_as_rent_only
+from rentals.models import Lease, TenantProfile, Unit
+from rentals.views import _payment_preview_rows, _payment_totals
+
+
+class AdvancePaymentRelabelTests(TestCase):
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="tenant@gmail.com",
+            username="tenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.unit = Unit.objects.create(number="P-101")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            is_active=True,
+        )
+
+    def test_relabels_full_payment_when_amount_matches_rent_and_parking_only(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("11550.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-ADV-1",
+            bill_ids=str(bill.id),
+            payment_type="full",
+            amount=Decimal("10350.00"),
+        )
+
+        self.assertTrue(should_relabel_full_payment_as_rent_only(payment))
+
+    def test_does_not_relabel_true_full_payment_including_water(self):
+        bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 2, 1),
+            due_date=date(2026, 2, 5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("350.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("11550.00"),
+        )
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            reference_code="REF-FULL-1",
+            bill_ids=str(bill.id),
+            payment_type="full",
+            amount=Decimal("11550.00"),
+        )
+
+        self.assertFalse(should_relabel_full_payment_as_rent_only(payment))
+
+
+class MoveInPaymentNotificationTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="stamaria@admin.com",
+            username="stamaria",
+            password="password123",
+            role=User.Role.ADMIN,
+        )
+        self.tenant = User.objects.create_user(
+            email="john.constantine@gmail.com",
+            username="johnconstantine",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="John",
+            last_name="Constantine",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(number="P-202")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("12000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+    def test_resolve_payment_tenant_user_prefers_metadata_tenant_id(self):
+        payment = ManualPayment(
+            user=self.admin,
+            payment_type="move_in",
+            metadata={"tenant_id": self.tenant.id, "lease_id": self.lease.id},
+        )
+
+        self.assertEqual(resolve_payment_tenant_user(payment), self.tenant)
+
+    def test_move_in_notification_uses_tenant_identity(self):
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            payment_type="move_in",
+            payment_method="PAYMONGO",
+            amount=Decimal("49896.00"),
+            reference_code="REF-PM-772F8DF8",
+            status="PENDING",
+            metadata={"tenant_id": self.tenant.id, "lease_id": self.lease.id},
+        )
+
+        with patch("payments.paymongo_workflow.Notification.create_notification") as notify_mock:
+            auto_approve_paymongo_payment(payment)
+
+        notify_mock.assert_called_once()
+        kwargs = notify_mock.call_args.kwargs
+        self.assertEqual(kwargs["title"], "Move-in payment received")
+        self.assertEqual(kwargs["notification_type"], "PAYMENT")
+        self.assertEqual(kwargs["recipient_type"], "ADMIN")
+        self.assertEqual(kwargs["related_tenant"], self.tenant)
+        self.assertIn("John Constantine", kwargs["message"])
+        self.assertIn("₱49,896.00", kwargs["message"])
+        self.assertIn("Payment reference: REF-PM-772F8DF8", kwargs["message"])
+        self.assertIn("Lease activated", kwargs["message"])
+        self.assertIn("First month's bill is paid", kwargs["message"])
+        self.assertNotIn("john.constantine@gmail.com", kwargs["message"])
+        self.assertNotIn("stamaria@admin.com", kwargs["message"])
+
+    def test_admin_generated_paymongo_checkout_is_owned_by_tenant(self):
+        self.client.force_login(self.admin)
+        self.lease.status = Lease.STATUS_PENDING_PAYMENT
+        self.lease.is_active = False
+        self.lease.save(update_fields=["status", "is_active"])
+
+        with patch("payments.views.create_paymongo_checkout_session_or_error") as checkout_mock:
+            checkout_mock.return_value = (
+                {
+                    "checkout_session_id": "cs_test_admin_movein",
+                    "checkout_url": "https://checkout.test/session",
+                },
+                None,
+            )
+            response = self.client.get(
+                reverse("admin_paymongo_checkout"),
+                {
+                    "amount": "30725.00",
+                    "lease_id": str(self.lease.id),
+                    "tenant_id": str(self.tenant.id),
+                },
+            )
+
+        self.assertEqual(response.status_code, 302)
+        payment = ManualPayment.objects.get(checkout_session_id="cs_test_admin_movein")
+        self.assertEqual(payment.user, self.tenant)
+        self.assertEqual(payment.metadata["generated_by_admin"], str(self.admin.id))
+        self.assertEqual(payment.metadata["tenant_id"], str(self.tenant.id))
+        self.assertEqual(payment.metadata["lease_id"], str(self.lease.id))
+
+    def test_admin_can_resolve_tenant_owned_checkout_by_session_id(self):
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            payment_type="move_in",
+            payment_method="PAYMONGO",
+            amount=Decimal("30725.00"),
+            reference_code="REF-PM-ADMIN",
+            status="PENDING",
+            checkout_session_id="cs_test_admin_lookup",
+            metadata={
+                "generated_by_admin": str(self.admin.id),
+                "tenant_id": str(self.tenant.id),
+                "lease_id": str(self.lease.id),
+            },
+        )
+
+        self.assertEqual(get_pending_paymongo_payment(self.admin, "cs_test_admin_lookup"), payment)
+
+    def test_pending_paymongo_move_in_for_active_lease_is_finalized(self):
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            payment_type="move_in",
+            payment_method="PAYMONGO",
+            amount=Decimal("36000.00"),
+            reference_code="REF-PM-ACTIVE",
+            status="PENDING",
+            checkout_session_id="cs_test_active_movein",
+            metadata={
+                "generated_by_admin": str(self.admin.id),
+                "tenant_id": str(self.tenant.id),
+                "lease_id": str(self.lease.id),
+            },
+        )
+
+        with patch("payments.paymongo_workflow.Notification.create_notification"):
+            auto_approve_paymongo_payment(payment)
+
+        payment.refresh_from_db()
+        first_bill = MonthlyBill.objects.get(lease=self.lease, billing_month=date(2026, 6, 1))
+        self.assertEqual(payment.status, "APPROVED")
+        self.assertEqual(payment.bill_ids, str(first_bill.id))
+        self.assertEqual(first_bill.status, "PAID")
+        self.assertEqual(first_bill.payment_reference, "REF-PM-ACTIVE")
+
+    def test_stale_move_in_lease_id_requires_manual_review_without_guessing(self):
+        self.lease.status = Lease.STATUS_TERMINATED
+        self.lease.is_active = False
+        self.lease.save(update_fields=["status", "is_active"])
+
+        stale_lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("12000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_PENDING_PAYMENT,
+            is_active=False,
+        )
+        stale_lease_id = stale_lease.id
+        stale_lease.delete()
+
+        replacement_unit = Unit.objects.create(number="P-203")
+        replacement_lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=replacement_unit,
+            monthly_rent=Decimal("12000.00"),
+            due_day=5,
+            start_date=date(2026, 6, 1),
+            status=Lease.STATUS_PENDING_PAYMENT,
+            is_active=False,
+        )
+
+        payment = ManualPayment.objects.create(
+            user=self.tenant,
+            payment_type="move_in",
+            payment_method="PAYMONGO",
+            amount=Decimal("36000.00"),
+            reference_code="REF-PM-STALE",
+            status="PENDING",
+            checkout_session_id="cs_test_stale_movein",
+            metadata={
+                "generated_by_admin": str(self.admin.id),
+                "tenant_id": str(self.tenant.id),
+                "lease_id": str(stale_lease_id),
+            },
+        )
+
+        with patch("payments.paymongo_workflow.Notification.create_notification"), patch("rentals.services.send_email_via_resend", return_value=True):
+            auto_approve_paymongo_payment(payment)
+
+        payment.refresh_from_db()
+        replacement_lease.refresh_from_db()
+        self.assertEqual(payment.status, "PENDING")
+        self.assertEqual(payment.metadata["lease_id"], str(stale_lease_id))
+        self.assertEqual(replacement_lease.status, Lease.STATUS_PENDING_PAYMENT)
+        self.assertFalse(replacement_lease.is_active)
+        self.assertFalse(MonthlyBill.objects.filter(lease=replacement_lease).exists())
+    def test_admin_payment_queryset_excludes_unpaid_paymongo_checkout_drafts(self):
+        draft = ManualPayment.objects.create(
+            user=self.tenant,
+            payment_type="rent_only",
+            payment_method="PAYMONGO",
+            amount=Decimal("10475.00"),
+            reference_code="REF-PM-DRAFT",
+            status="PENDING",
+            checkout_session_id="cs_test_cancelled",
+        )
+        paid_pending = ManualPayment.objects.create(
+            user=self.tenant,
+            payment_type="rent_only",
+            payment_method="PAYMONGO",
+            amount=Decimal("10475.00"),
+            reference_code="REF-PM-PAID",
+            status="PENDING",
+            checkout_session_id="cs_test_paid",
+            paymongo_payment_id="pay_test_paid",
+        )
+
+        payments = list(_admin_payment_queryset())
+
+        self.assertNotIn(draft, payments)
+        self.assertIn(paid_pending, payments)
+
+
+class TenantAdvancePaymentMaintenancePreviewTests(TestCase):
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="preview.tenant@gmail.com",
+            username="previewtenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        TenantProfile.objects.create(
+            user=self.tenant,
+            first_name="Preview",
+            last_name="Tenant",
+            password_change_required=False,
+            created_by=None,
+        )
+        self.unit = Unit.objects.create(number="PV-101")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+        self.bill = MonthlyBill.objects.create(
+            lease=self.lease,
+            billing_month=date(2026, 7, 1),
+            due_date=date(2026, 7, 5),
+            base_rent=Decimal("10000.00"),
+            water_amount=Decimal("1200.00"),
+            parking_fee=Decimal("500.00"),
+            interest=Decimal("0.00"),
+            total_due=Decimal("12600.00"),
+            status="UNPAID",
+        )
+        BillLineItem.objects.create(
+            monthly_bill=self.bill,
+            line_type=BillLineItem.LINE_TYPE_MAINTENANCE,
+            amount=Decimal("900.00"),
+        )
+
+    def test_full_payment_preview_rows_include_maintenance_charge(self):
+        preview_rows = _payment_preview_rows(self.lease, [self.bill], "full")
+        totals = _payment_totals(preview_rows, "full")
+
+        self.assertEqual(totals["total_maintenance"], 900.0)
+        self.assertEqual(preview_rows[0]["maintenance"], 900.0)
+        self.assertEqual(preview_rows[0]["pay_maintenance"], 900.0)
+
+    def test_maintenance_only_preview_rows_include_only_maintenance_charge(self):
+        preview_rows = _payment_preview_rows(self.lease, [self.bill], "maintenance_only")
+        totals = _payment_totals(preview_rows, "maintenance_only")
+
+        self.assertEqual(totals["total_amount"], 900.0)
+        self.assertEqual(totals["total_rent"], 0.0)
+        self.assertEqual(totals["total_water"], 0.0)
+        self.assertEqual(totals["total_maintenance"], 900.0)
+        self.assertEqual(preview_rows[0]["pay_rent"], 0.0)
+        self.assertEqual(preview_rows[0]["pay_water"], 0.0)
+        self.assertEqual(preview_rows[0]["pay_maintenance"], 900.0)
+
+
+class F2FCashScheduleTests(TestCase):
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="cash.tenant@gmail.com",
+            username="cashtenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.unit = Unit.objects.create(number="C-101")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+    def _create_bills(self, count=7):
+        bills = []
+        for month in range(1, count + 1):
+            bills.append(
+                MonthlyBill.objects.create(
+                    lease=self.lease,
+                    billing_month=date(2026, month, 1),
+                    due_date=date(2026, month, 5),
+                    base_rent=Decimal("10000.00"),
+                    water_amount=Decimal("0.00"),
+                    parking_fee=Decimal("0.00"),
+                    interest=Decimal("0.00"),
+                    total_due=Decimal("10000.00"),
+                    status="UNPAID",
+                )
+            )
+        return bills
+
+    def test_f2f_cash_rejects_more_than_six_months(self):
+        self.client.force_login(self.tenant)
+        bills = self._create_bills()
+        url = reverse("f2f_cash_payment")
+
+        response = self.client.post(url, {
+            "amount": "70000.00",
+            "bill_ids": ",".join(str(bill.id) for bill in bills),
+            "payment_type": "rent_only",
+            "preferred_date": "2026-06-05",
+            "preferred_time": "10:00",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "currently limited to 6 months")
+        self.assertEqual(ManualPayment.objects.filter(payment_method="CASH").count(), 0)
+
+    def test_paymongo_checkout_rejects_more_than_six_months(self):
+        self.client.force_login(self.tenant)
+        bills = self._create_bills()
+
+        with patch("payments.views.create_paymongo_checkout_session_or_error") as checkout_mock:
+            response = self.client.post(reverse("paymongo_checkout"), {
+                "amount": "70000.00",
+                "bill_ids": ",".join(str(bill.id) for bill in bills),
+                "payment_type": "rent_only",
+            })
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, reverse("tenant_pay_advance"))
+        checkout_mock.assert_not_called()
+        self.assertEqual(
+            ManualPayment.objects.filter(user=self.tenant, payment_method="PAYMONGO").count(),
+            0,
+        )
+
+    def test_f2f_cash_rejects_weekend_and_outside_office_hours(self):
+        self.client.force_login(self.tenant)
+        url = reverse("f2f_cash_payment")
+
+        weekend_response = self.client.post(url, {
+            "amount": "1000.00",
+            "bill_ids": "1",
+            "payment_type": "rent_only",
+            "preferred_date": "2026-06-06",
+            "preferred_time": "10:00",
+        })
+        out_of_hours_response = self.client.post(url, {
+            "amount": "1000.00",
+            "bill_ids": "1",
+            "payment_type": "rent_only",
+            "preferred_date": "2026-06-05",
+            "preferred_time": "18:00",
+        })
+
+        self.assertEqual(weekend_response.status_code, 200)
+        self.assertContains(weekend_response, "Monday to Friday")
+        self.assertEqual(out_of_hours_response.status_code, 200)
+        self.assertContains(out_of_hours_response, "office hours")
+        self.assertEqual(ManualPayment.objects.filter(payment_method="CASH").count(), 0)
+
+
+
+class SeedDemoPaymentsCommandTests(TestCase):
+    def setUp(self):
+        self.tenant = User.objects.create_user(
+            email="seed.tenant@gmail.com",
+            username="seedtenant",
+            password="password123",
+            role=User.Role.TENANT,
+        )
+        self.unit = Unit.objects.create(number="SD-101")
+        self.lease = Lease.objects.create(
+            tenant=self.tenant,
+            unit=self.unit,
+            monthly_rent=Decimal("10000.00"),
+            due_day=5,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            status=Lease.STATUS_ACTIVE,
+            is_active=True,
+        )
+
+    @override_settings(DEBUG=False, DEMO_MODE=False)
+    def test_command_requires_debug_or_demo_mode(self):
+        with self.assertRaisesMessage(CommandError, "seed_demo_payments can only run"):
+            call_command("seed_demo_payments", months=3)
+
+    @override_settings(DEBUG=False, DEMO_MODE=True)
+    def test_command_seeds_paid_history_without_side_effects(self):
+        out = StringIO()
+
+        call_command("seed_demo_payments", months=3, stdout=out)
+
+        payments = ManualPayment.objects.filter(reference_code__startswith="REF-DEMO-SEED-").order_by("reference_code")
+        bills = MonthlyBill.objects.filter(lease=self.lease).order_by("billing_month")
+
+        self.assertEqual(payments.count(), 3)
+        self.assertEqual(bills.count(), 3)
+        self.assertEqual(BillingInvoice.objects.count(), 0)
+
+        for payment in payments:
+            self.assertEqual(payment.status, "APPROVED")
+            self.assertEqual(payment.payment_type, "full")
+            self.assertEqual(payment.metadata.get("seed_label"), "Seeded Demo Payment.")
+
+        for bill in bills:
+            self.assertEqual(bill.status, "PAID")
+            self.assertEqual(bill.total_balance, Decimal("0.00"))
+            self.assertTrue(bill.payment_reference.startswith("REF-DEMO-SEED-"))
+            self.assertEqual(bill.rent_paid, bill.base_rent)
+            self.assertEqual(bill.water_paid, bill.water_amount)
+            self.assertEqual(bill.parking_paid, bill.parking_fee)
+            self.assertIsNotNone(bill.paid_at)
+            line_items = BillLineItem.objects.filter(monthly_bill=bill)
+            self.assertTrue(line_items.exists())
+            for line in line_items:
+                if line.amount > 0:
+                    self.assertEqual(line.status, BillLineItem.STATUS_PAID)
+                    self.assertEqual(line.paid_amount, line.amount)
+                    self.assertEqual(line.payment_reference, bill.payment_reference)
+
+        output = out.getvalue()
+        self.assertIn("Months covered:", output)
+        self.assertIn("Payments created: 3", output)
+        self.assertIn("Bills updated: 3", output)
+
+    @override_settings(DEBUG=False, DEMO_MODE=True)
+    def test_command_is_idempotent(self):
+        first_out = StringIO()
+        second_out = StringIO()
+
+        call_command("seed_demo_payments", months=2, stdout=first_out)
+        call_command("seed_demo_payments", months=2, stdout=second_out)
+
+        self.assertEqual(ManualPayment.objects.filter(reference_code__startswith="REF-DEMO-SEED-").count(), 2)
+        self.assertIn("Skipped already-seeded: 2", second_out.getvalue())
+        self.assertIn("Payments created: 0", second_out.getvalue())
+

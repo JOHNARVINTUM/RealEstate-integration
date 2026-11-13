@@ -1,0 +1,553 @@
+{% extends "admin_portal/base.html" %}
+{% load humanize %}
+{% block title %}{% if is_staff_portal %}Update Assigned Issue #{{ req.id }}{% else %}{% if is_staff_portal %}Update Assigned Issue #{{ req.id }}{% else %}Resolve Issue #{{ req.id }}{% endif %}{% endif %} | Real Estate Administration{% endblock %}
+
+{% block content %}
+<div class="tenant-form-wrapper max-w-7xl mx-auto font-sans text-slate-900 space-y-6 pb-12 px-2 sm:px-4 lg:px-6 py-4 sm:py-6">
+  
+  <!-- Navigation: Simple Back Button -->
+  <nav class="flex items-center">
+    <a href="{{ back_url }}" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-xs group">
+      <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+      </svg>
+      <span>Back</span>
+    </a>
+  </nav>
+
+  <div class="flex flex-col lg:flex-row gap-8">
+    
+    <!-- Left Column: Problem Details -->
+    <div class="flex-1 space-y-6">
+      
+      
+      <!-- Form Header -->
+      <header class="bg-white border border-slate-200 rounded-2xl p-6 lg:p-8 shadow-sm flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6 relative overflow-hidden mb-6">
+        <div class="relative z-10">
+          <div class="flex items-center gap-3 mb-2">
+            <div class="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-700 shadow-sm border border-slate-200">
+              <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+              </svg>
+            </div>
+            <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 leading-tight">{% if is_staff_portal %}Update Assigned Issue #{{ req.id }}{% else %}Resolve Issue #{{ req.id }}{% endif %}</h1>
+          </div>
+          <p class="text-sm text-slate-500 mt-1 pl-13 ml-1">
+            {% if is_staff_portal %}Update the progress of this assigned maintenance request.{% else %}Review this request, decide whether to accept or reject it, and assign staff after acceptance.{% endif %}
+          </p>
+        </div>
+      </header>
+
+      <!-- Main Info Card -->
+      <div class="bg-white border border-slate-200 rounded-xl p-8 shadow-xs">
+        
+        <!-- Category and Date -->
+        <div class="flex justify-between items-start mb-6">
+          <div>
+            <span class="text-[11px] font-black text-slate-500 uppercase tracking-tight block mb-2">Issue Category</span>
+            <span class="px-4 py-1.5 bg-slate-100 border border-slate-200 text-slate-800 rounded-lg text-xs font-black uppercase tracking-tight select-none">
+            {{ req.get_category_display }}
+            </span>
+          </div>
+          <div class="text-right">
+            <span class="text-[11px] font-black text-slate-500 uppercase tracking-tight block">Reported on</span>
+            <strong class="text-base font-black text-slate-900">{{ req.created_at|date:"M d, Y" }}</strong>
+          </div>
+        </div>
+
+        <!-- Problem Title -->
+        <h1 class="text-2xl sm:text-3xl font-black text-slate-900 mb-4 tracking-tight">{{ req.title }}</h1>
+        
+        <!-- Description Box -->
+        <div class="bg-slate-50 border border-slate-200 rounded-xl p-6 mb-8">
+          <span class="text-xs font-black text-slate-500 uppercase tracking-tight block mb-2">What needs fixing</span>
+          <p class="text-slate-800 leading-relaxed text-base font-bold whitespace-pre-wrap">{{ req.description }}</p>
+        </div>
+
+        {% if req.photo_url %}
+        <!-- Photo Attachment Box -->
+        <div class="bg-white border border-slate-200 rounded-xl p-6 mb-8">
+          <span class="text-xs font-black text-slate-500 uppercase tracking-tight block mb-4">Attached Photo</span>
+          <div class="rounded-xl overflow-hidden border border-slate-200 max-w-full lg:max-w-xl shadow-sm">
+            <a href="{{ req.photo_url }}" target="_blank" rel="noreferrer noopener">
+              <img src="{{ req.photo_url }}" alt="Maintenance Request Photo" class="w-full h-auto object-contain bg-slate-50">
+            </a>
+          </div>
+        </div>
+        {% else %}
+        <div class="bg-white border border-slate-200 rounded-xl p-6 mb-8">
+          <span class="text-xs font-black text-slate-500 uppercase tracking-tight block mb-4">Attached Photo</span>
+          <div class="rounded-xl border border-slate-200 p-6 text-slate-500 text-sm">
+            No photo is available for this request.
+          </div>
+        </div>
+        {% endif %}
+
+        {% if req.requested_schedule_at %}
+        <div class="bg-blue-50 border border-blue-100 rounded-xl p-6 mb-8">
+          <span class="text-xs font-black text-blue-700 uppercase tracking-tight block mb-2">Tenant Preferred Visit</span>
+          <p class="text-slate-900 text-lg font-black">{{ req.requested_schedule_at|date:"M d, Y" }} at {{ req.requested_schedule_at|date:"h:i A" }}</p>
+          <p class="text-sm font-bold text-blue-700 mt-2">Admin can approve this time, reschedule it, or decline it with a note.</p>
+        </div>
+        {% endif %}
+
+        <!-- Tenant & Unit Info -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+          
+          <!-- Tenant Info -->
+          <div class="p-5 bg-white border border-slate-200 rounded-xl shadow-xs">
+            <span class="text-[11px] font-black text-slate-500 uppercase block mb-2">Tenant</span>
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-800 font-black text-sm shrink-0">
+                {% if req.tenant.tenantprofile.first_name %}{{ req.tenant.tenantprofile.first_name|first|upper }}{% else %}{{ req.tenant.email|first|upper }}{% endif %}
+              </div>
+              <div class="min-w-0">
+                <div class="text-base font-black text-slate-900 truncate">{% if req.tenant.tenantprofile.first_name %}{{ req.tenant.tenantprofile.first_name }} {{ req.tenant.tenantprofile.last_name }}{% else %}{{ req.tenant.email }}{% endif %}</div>
+                <div class="text-xs text-slate-500 font-bold">Contact Person</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Unit Info -->
+          <div class="p-5 bg-white border border-slate-200 rounded-xl shadow-xs">
+            <span class="text-[11px] font-black text-slate-500 uppercase block mb-2">Location</span>
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-800 font-black text-sm shrink-0">
+                #
+              </div>
+              <div class="min-w-0">
+                <div class="text-base font-black text-slate-900">Unit #{{ req.lease.unit.number }}</div>
+                <div class="text-xs text-slate-500 font-bold">{{ req.lease.unit.get_unit_type_display }}</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+
+      <!-- Current Status Bar -->
+      <div class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
+        <div>
+          <span class="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1">Work Status</span>
+          <div class="text-xl font-black text-slate-900">
+            {% if req.status == 'RESOLVED' %}
+              <span class="text-emerald-700 flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path></svg>
+                Fixed
+              </span>
+            {% elif req.status == 'IN_PROGRESS' %}
+              <span class="text-indigo-700 flex items-center gap-2">
+                <svg class="w-5 h-5 animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                Being fixed
+              </span>
+            {% else %}
+              <span class="text-amber-700 flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                Waiting to start
+              </span>
+            {% endif %}
+          </div>
+        </div>
+
+        <span class="hidden sm:block w-px h-10 bg-slate-200"></span>
+
+        <div>
+          <span class="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1">Review</span>
+          <div class="text-base font-black">
+            {% if req.review_status == 'ACCEPTED' %}
+              <span class="text-emerald-700 uppercase tracking-wider">Accepted</span>
+            {% elif req.review_status == 'REJECTED' %}
+              <span class="text-rose-700 uppercase tracking-wider">Rejected</span>
+            {% else %}
+              <span class="text-amber-700 uppercase tracking-wider">Pending Review</span>
+            {% endif %}
+          </div>
+          <div class="text-xs font-bold text-slate-500 mt-1">
+            {% if req.assigned_staff %}Assigned to {{ req.assigned_staff.tenantprofile.full_name|default:req.assigned_staff.email }}{% else %}No staff assigned yet{% endif %}
+          </div>
+        </div>
+
+        <span class="hidden sm:block w-px h-10 bg-slate-200"></span>
+
+        <div class="sm:text-right">
+          <span class="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1">Priority Level</span>
+          <div class="text-base font-black">
+            {% if req.priority == 'HIGH' or req.priority == 'URGENT' %}
+              <span class="text-rose-700 uppercase tracking-wider">High</span>
+            {% elif req.priority == 'MEDIUM' %}
+              <span class="text-amber-700 uppercase tracking-wider">Medium</span>
+            {% else %}
+              <span class="text-slate-600 uppercase tracking-wider">Low</span>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Right Column: Update Status Form -->
+    <div class="w-full lg:w-96 shrink-0 space-y-6">
+      {% if can_browse_builtasupply %}
+      <a href="{{ builtasupply_shop_url }}" target="_blank" rel="noopener noreferrer" class="flex w-full items-center justify-center gap-2 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm font-extrabold text-indigo-800 transition-colors hover:bg-indigo-100">
+        Browse supplies on BUILTASUPPLY
+      </a>
+      {% endif %}
+      {% if supply_order or can_link_supply_order %}
+      <div class="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
+        <h2 class="text-lg font-black text-slate-900">BUILTASUPPLY delivery</h2>
+        {% if supply_order %}
+          <p class="mt-2 text-sm font-bold text-slate-700">Order {{ supply_order.order_number }} · {{ supply_order.get_delivery_status_display }}</p>
+          {% if supply_order.last_synced_at %}<p class="mt-1 text-xs text-slate-500">Last refreshed {{ supply_order.last_synced_at|date:"M d, Y h:i A" }}</p>{% endif %}
+          {% if supply_order.last_sync_error %}<p class="mt-2 text-xs font-bold text-amber-700">{{ supply_order.last_sync_error }}</p>{% endif %}
+          {% if can_link_supply_order %}<form method="post" action="{% url 'admin_refresh_maintenance_supply_order' req.id %}" class="mt-3">{% csrf_token %}<button type="submit" class="text-sm font-extrabold text-indigo-700 hover:text-indigo-900">Refresh delivery status</button></form>{% endif %}
+        {% elif can_link_supply_order %}
+          <p class="mt-1 text-sm text-slate-500">After checkout, enter only the BUILTASUPPLY order number to track delivery here.</p>
+          <form method="post" action="{% url 'admin_link_maintenance_supply_order' req.id %}" class="mt-4 space-y-3">{% csrf_token %}<input name="order_number" required maxlength="24" placeholder="BUILTASUPPLY order number" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"><button type="submit" class="w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-extrabold text-white hover:bg-indigo-700">Link order</button></form>
+        {% endif %}
+      </div>
+      {% endif %}
+      <div class="bg-white border border-slate-200 rounded-xl p-8 shadow-xs">
+        
+        <h2 class="text-lg font-black text-slate-900">{% if is_staff_portal %}Update Progress{% else %}Review & Assignment{% endif %}</h2>
+        <p class="text-sm text-slate-500 mt-1 mb-6 font-bold leading-relaxed">{% if is_staff_portal %}You can update only the work progress for this request.{% else %}Accept or reject the request first, then assign a staff member for accepted work.{% endif %}</p>
+
+        <form method="post" class="space-y-5" id="maintenanceUpdateForm" data-requested-schedule='{% if req.requested_schedule_at %}{{ req.requested_schedule_at|date:"Y-m-d\TH:i" }}{% endif %}' data-assigned-staff-name='{% if req.assigned_staff %}{{ req.assigned_staff.tenantprofile.full_name|default:req.assigned_staff.username }}{% endif %}'>
+          {% csrf_token %}
+          <input type="hidden" name="form_action" value="progress">
+          
+          {% for field in form %}
+          <div class="space-y-2">
+            <label for="{{ field.id_for_label }}" class="block text-sm font-black text-slate-800 uppercase tracking-wider mb-2">
+              {% if field.name == 'category' %}
+                <div class="relative group/tooltip inline-block">
+                  <span class="cursor-help inline-block border-b border-dashed border-slate-300 pb-0.5">{{ field.label }}</span>
+                  <div class="absolute bottom-full left-0 mb-2 w-[250px] px-3 py-2 bg-slate-900 text-white rounded-lg shadow-xl text-xs font-bold opacity-0 invisible group-hover/tooltip:opacity-100 group-hover/tooltip:visible transition-all duration-300 z-50 pointer-events-none border border-slate-700 whitespace-normal delay-[150ms]">
+                    <strong class="block text-indigo-400 mb-1">Note</strong>
+                    Auto-classified from tenant description. Admin can override if needed.
+                    <div class="absolute top-full left-6 -translate-x-1/2 border-[5px] border-transparent border-t-slate-900"></div>
+                  </div>
+                </div>
+              {% elif field.name == 'admin_scheduled_at' %}
+                <div class="relative group/tooltip inline-block">
+                  <span class="cursor-help inline-block border-b border-dashed border-slate-300 pb-0.5">{{ field.label }}</span>
+                  <div class="absolute bottom-full left-0 mb-2 w-[250px] px-3 py-2 bg-slate-900 text-white rounded-lg shadow-xl text-xs font-bold opacity-0 invisible group-hover/tooltip:opacity-100 group-hover/tooltip:visible transition-all duration-300 z-50 pointer-events-none border border-slate-700 whitespace-normal delay-[150ms]">
+                    <strong class="block text-indigo-400 mb-1">Important</strong>
+                    Leave blank when approving the tenant's preferred time. Required when rescheduling.
+                    <div class="absolute top-full left-6 -translate-x-1/2 border-[5px] border-transparent border-t-slate-900"></div>
+                  </div>
+                </div>
+              {% else %}
+                {{ field.label }}
+              {% endif %}
+            </label>
+            
+            <div class="relative">
+              {% if field.name == 'category' or field.name == 'status' or field.name == 'priority' or field.name == 'schedule_decision' or field.name == 'review_status' or field.name == 'assigned_staff' or field.name == 'fixed_by' %}
+                <select name="{{ field.name }}" id="{{ field.id_for_label }}" 
+                        class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 hover:border-slate-400 shadow-sm transition-all outline-none cursor-pointer appearance-none">
+                  {% for val, label in field.field.choices %}
+                    <option value="{{ val }}" {% if field.value == val %}selected{% endif %}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+                <div class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">
+                  <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7"></path></svg>
+                </div>
+              {% elif field.name == 'admin_scheduled_at' %}
+                <input type="datetime-local"
+                       name="{{ field.name }}"
+                       id="{{ field.id_for_label }}"
+                       value="{% if req.admin_scheduled_at %}{{ req.admin_scheduled_at|date:"Y-m-d\TH:i" }}{% endif %}"
+                       placeholder="{{ field.label }}"
+                       class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 hover:border-slate-400 shadow-sm transition-all outline-none">
+              {% elif field.name == 'schedule_admin_note' %}
+                <textarea name="{{ field.name }}"
+                          id="{{ field.id_for_label }}"
+                          placeholder="{{ field.label }}"
+                          rows="3"
+                          class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 hover:border-slate-400 shadow-sm transition-all outline-none">{{ field.value|default:'' }}</textarea>
+              {% else %}
+                <input type="{{ field.field.widget.input_type|default:'text' }}" 
+                       name="{{ field.name }}" 
+                       id="{{ field.id_for_label }}" 
+                       value="{{ field.value|default:'' }}"
+                       placeholder="{{ field.label }}"
+                       class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 hover:border-slate-400 shadow-sm transition-all outline-none">
+              {% endif %}
+            </div>
+
+            {% if field.errors %}
+              <span class="block text-xs font-black text-rose-600 mt-1">
+                {{ field.errors.0 }}
+              </span>
+            {% endif %}
+          </div>
+          {% endfor %}
+
+          <div class="pt-6 space-y-3">
+            <button type="submit" class="w-full py-4 bg-slate-800 hover:bg-slate-900 text-white rounded-lg font-extrabold text-base transition-colors text-white rounded-lg font-extrabold text-sm transition-all text-center shadow-lg active:scale-95">
+              {% if is_staff_portal %}Save Progress{% else %}Save Review{% endif %}
+            </button>
+            <a href="{{ back_url }}" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-xs group">
+              <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+              </svg>
+              <span>Back</span>
+            </a>
+          </div>
+
+        </form>
+
+      </div>
+
+      <div class="bg-white border border-slate-200 rounded-xl p-8 shadow-xs">
+        <div class="flex items-start justify-between gap-4 mb-5">
+          <div>
+            <h2 class="text-lg font-black text-slate-900">{% if is_staff_portal %}Repair Cost Suggestion{% else %}Repair Charge Review{% endif %}</h2>
+            <p class="text-sm text-slate-500 mt-1 font-bold leading-relaxed">{% if is_staff_portal %}Record the diagnosis and suggested repair cost for admin review. This does not create a tenant charge yet.{% else %}Review the staff suggestion, approve it as-is or with an adjusted amount, or mark the request as no charge. Billing is not posted yet in this phase.{% endif %}</p>
+          </div>
+          <span class="px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider {% if charge %}{% if charge.status == 'PENDING_REVIEW' %}bg-amber-50 text-amber-700 border border-amber-200{% elif charge.status == 'NO_CHARGE' %}bg-slate-100 text-slate-600 border border-slate-200{% else %}bg-emerald-50 text-emerald-700 border border-emerald-200{% endif %}{% else %}bg-slate-100 text-slate-600 border border-slate-200{% endif %}">
+            {% if charge %}{{ charge.get_status_display }}{% else %}Not yet started{% endif %}
+          </span>
+        </div>
+
+        {% if is_staff_portal %}
+          {% if charge_form and can_edit_charge %}
+          <form method="post" class="space-y-5" id="maintenanceChargeSuggestionForm">
+            {% csrf_token %}
+            <input type="hidden" name="form_action" value="charge_suggestion">
+
+            {% if charge_form.non_field_errors %}
+            <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">
+              {{ charge_form.non_field_errors.0 }}
+            </div>
+            {% endif %}
+
+            {% for field in charge_form %}
+            <div class="space-y-2">
+              <label for="{{ field.id_for_label }}" class="block text-sm font-black text-slate-800 uppercase tracking-wider">{{ field.label }}</label>
+              {% if field.name == 'diagnosis' or field.name == 'repair_notes' %}
+                <textarea name="{{ field.name }}" id="{{ field.id_for_label }}" rows="{{ field.field.widget.attrs.rows|default:3 }}" placeholder="{{ field.field.widget.attrs.placeholder|default:field.label }}" class="w-full px-4 py-3 bg-white border border-slate-300 rounded-lg text-base font-medium text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 hover:border-slate-400 shadow-sm transition-all outline-none">{{ field.value|default:'' }}</textarea>
+              {% else %}
+                <input type="number" step="0.01" min="0" name="{{ field.name }}" id="{{ field.id_for_label }}" value="{{ field.value|default_if_none:'' }}" {% if field.field.disabled %}readonly{% endif %} class="w-full px-4 py-3 {% if field.field.disabled %}bg-slate-50 text-slate-600{% else %}bg-white text-slate-900{% endif %} border border-slate-300 rounded-lg text-base font-medium focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 hover:border-slate-400 shadow-sm transition-all outline-none">
+              {% endif %}
+              {% if field.errors %}
+                <span class="block text-xs font-black text-rose-600 mt-1">{{ field.errors.0 }}</span>
+              {% endif %}
+            </div>
+            {% endfor %}
+
+            <div class="rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-4">
+              <span class="block text-[11px] font-black uppercase tracking-widest text-indigo-500">Computed Suggested Total</span>
+              <div class="mt-2 text-2xl font-black text-slate-900" id="chargeSuggestedTotalDisplay">PHP {{ charge_form.instance.suggested_total|default:0|floatformat:2 }}</div>
+              <p class="mt-1 text-xs font-bold text-slate-500">Automatically computed from labor cost and material cost.</p>
+            </div>
+
+            <button type="submit" class="w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-extrabold text-sm transition-all text-center shadow-lg active:scale-95">
+              {% if charge %}Update Repair Cost Suggestion{% else %}Save Repair Cost Suggestion{% endif %}
+            </button>
+          </form>
+          {% else %}
+          <div class="rounded-xl border border-slate-200 bg-slate-50 p-5 space-y-3">
+            {% if locked_charge_message %}
+              <p class="text-sm font-bold text-slate-700">{{ locked_charge_message }}</p>
+            {% else %}
+              <p class="text-sm font-bold text-slate-700">Repair cost suggestion is not available for this request.</p>
+            {% endif %}
+            {% if charge %}
+            <div class="grid grid-cols-1 gap-3 text-sm">
+              <div>
+                <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Diagnosis</span>
+                <div class="mt-1 font-semibold text-slate-900 whitespace-pre-wrap">{{ charge.diagnosis|default:"No diagnosis provided yet." }}</div>
+              </div>
+              <div>
+                <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Repair Notes</span>
+                <div class="mt-1 font-semibold text-slate-900 whitespace-pre-wrap">{{ charge.repair_notes|default:"No repair notes provided yet." }}</div>
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Labor Cost</span>
+                  <div class="mt-1 font-black text-slate-900">PHP {{ charge.labor_cost|floatformat:2 }}</div>
+                </div>
+                <div>
+                  <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Material Cost</span>
+                  <div class="mt-1 font-black text-slate-900">PHP {{ charge.material_cost|floatformat:2 }}</div>
+                </div>
+              </div>
+              <div>
+                <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Suggested Total</span>
+                <div class="mt-1 text-xl font-black text-slate-900">PHP {{ charge.suggested_total|floatformat:2 }}</div>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+          {% endif %}
+        {% else %}
+          <div class="space-y-5">
+            {% if charge %}
+            <div class="rounded-xl border border-slate-200 bg-slate-50 p-5 space-y-4">
+              <div class="grid grid-cols-1 gap-3 text-sm">
+                <div>
+                  <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Suggested By</span>
+                  <div class="mt-1 font-semibold text-slate-900">{{ charge.suggested_by.tenantprofile.full_name|default:charge.suggested_by.email|default:"Unknown staff" }}</div>
+                </div>
+                <div>
+                  <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Diagnosis</span>
+                  <div class="mt-1 font-semibold text-slate-900 whitespace-pre-wrap">{{ charge.diagnosis|default:"No diagnosis provided yet." }}</div>
+                </div>
+                <div>
+                  <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Repair Notes</span>
+                  <div class="mt-1 font-semibold text-slate-900 whitespace-pre-wrap">{{ charge.repair_notes|default:"No repair notes provided yet." }}</div>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Labor Cost</span>
+                    <div class="mt-1 font-black text-slate-900">PHP {{ charge.labor_cost|floatformat:2 }}</div>
+                  </div>
+                  <div>
+                    <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Material Cost</span>
+                    <div class="mt-1 font-black text-slate-900">PHP {{ charge.material_cost|floatformat:2 }}</div>
+                  </div>
+                </div>
+                <div>
+                  <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Suggested Total</span>
+                  <div class="mt-1 text-xl font-black text-slate-900">PHP {{ charge.suggested_total|floatformat:2 }}</div>
+                </div>
+                {% if charge.admin_approved_total is not None %}
+                <div>
+                  <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Approved Amount</span>
+                  <div class="mt-1 text-xl font-black text-emerald-700">PHP {{ charge.admin_approved_total|floatformat:2 }}</div>
+                </div>
+                {% endif %}
+                <div>
+                  <span class="block text-[11px] font-black uppercase tracking-wider text-slate-500">Billing Link</span>
+                  <div class="mt-1 font-semibold text-slate-900">
+                    {% if charge.bill_line_item %}
+                      Bill {{ charge.bill_line_item.monthly_bill.billing_month|date:"M Y" }} ? Maintenance line linked
+                    {% elif charge.status == 'READY_FOR_BILLING' %}
+                      Waiting to be attached to a valid unpaid/upcoming bill
+                    {% else %}
+                      Not yet linked to billing
+                    {% endif %}
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            {% if admin_charge_form and can_review_charge %}
+            <form method="post" class="space-y-5" id="maintenanceChargeReviewForm">
+              {% csrf_token %}
+              <input type="hidden" name="form_action" value="charge_review">
+
+              {% if admin_charge_form.non_field_errors %}
+              <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">
+                {{ admin_charge_form.non_field_errors.0 }}
+              </div>
+              {% endif %}
+
+              <div class="space-y-2">
+                <label for="{{ admin_charge_form.admin_approved_total.id_for_label }}" class="block text-sm font-black text-slate-800 uppercase tracking-wider">{{ admin_charge_form.admin_approved_total.label }}</label>
+                <input type="number" step="0.01" min="0" name="{{ admin_charge_form.admin_approved_total.html_name }}" id="{{ admin_charge_form.admin_approved_total.id_for_label }}" value="{{ admin_charge_form.admin_approved_total.value|default_if_none:'' }}" class="w-full px-4 py-3 bg-white text-slate-900 border border-slate-300 rounded-lg text-base font-medium focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 hover:border-slate-400 shadow-sm transition-all outline-none">
+                {% if admin_charge_form.admin_approved_total.errors %}
+                  <span class="block text-xs font-black text-rose-600 mt-1">{{ admin_charge_form.admin_approved_total.errors.0 }}</span>
+                {% endif %}
+                <p class="text-xs font-bold text-slate-500">Use this field only when approving with an adjusted amount. Approve as-is will use the staff suggested total.</p>
+              </div>
+
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <button type="submit" name="charge_review_action" value="approve_as_is" class="py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-extrabold text-sm transition-all text-center shadow-lg active:scale-95">Approve As-Is</button>
+                <button type="submit" name="charge_review_action" value="approve_adjusted" class="py-3 bg-slate-800 hover:bg-slate-900 text-white rounded-lg font-extrabold text-sm transition-all text-center shadow-lg active:scale-95">Approve Adjusted</button>
+                <button type="submit" name="charge_review_action" value="no_charge" class="py-3 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-lg font-extrabold text-sm transition-all text-center shadow-xs active:scale-95">Mark No Charge</button>
+              </div>
+            </form>
+            {% else %}
+            <div class="rounded-xl border border-slate-200 bg-slate-50 p-5 space-y-4">
+              <p class="text-sm font-bold text-slate-700">{{ admin_charge_lock_message|default:"Repair charge review is not available for this request." }}</p>
+              {% if charge and charge.status == 'READY_FOR_BILLING' and not charge.bill_line_item %}
+              <form method="post">
+                {% csrf_token %}
+                <input type="hidden" name="form_action" value="charge_post">
+                <button type="submit" class="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-extrabold text-sm transition-all text-center shadow-lg active:scale-95">
+                  Retry Posting to Billing
+                </button>
+              </form>
+              {% endif %}
+            </div>
+            {% endif %}
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+  </div>
+
+</div>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    const form = document.getElementById('maintenanceUpdateForm');
+    if (!form) return;
+
+    const requestedSchedule = form.dataset.requestedSchedule || '';
+    const existingAssignedStaffName = form.dataset.assignedStaffName || '';
+    const decisionSelect = form.querySelector('[name="schedule_decision"]');
+    const approvedTimeInput = form.querySelector('[name="admin_scheduled_at"]');
+    const assignedStaffSelect = form.querySelector('[name="assigned_staff"]');
+    const fixedBySelect = form.querySelector('[name="fixed_by"]');
+    const previousFixedByValue = fixedBySelect ? fixedBySelect.value : '';
+
+    function syncApprovedVisitTime() {
+      if (decisionSelect && approvedTimeInput && requestedSchedule && decisionSelect.value === 'APPROVED' && !approvedTimeInput.value) {
+        approvedTimeInput.value = requestedSchedule;
+      }
+    }
+
+    function syncCompletedBy(forceUpdate = false) {
+      if (!assignedStaffSelect || !fixedBySelect) return;
+      const selectedText = assignedStaffSelect.options[assignedStaffSelect.selectedIndex] ? assignedStaffSelect.options[assignedStaffSelect.selectedIndex].text.trim() : '';
+      const currentFixedBy = fixedBySelect.value || '';
+      const canAutoFill = !currentFixedBy || currentFixedBy === existingAssignedStaffName || currentFixedBy === previousFixedByValue;
+      if ((forceUpdate || canAutoFill) && selectedText) {
+        const matchingOption = Array.from(fixedBySelect.options).find(option => option.value === selectedText);
+        if (matchingOption) {
+          fixedBySelect.value = selectedText;
+        }
+      }
+    }
+
+    if (decisionSelect) {
+      decisionSelect.addEventListener('change', syncApprovedVisitTime);
+      syncApprovedVisitTime();
+    }
+
+    if (assignedStaffSelect && fixedBySelect) {
+      assignedStaffSelect.addEventListener('change', function () {
+        syncCompletedBy(true);
+      });
+      syncCompletedBy(false);
+    }
+
+    const laborCostInput = document.getElementById('id_labor_cost');
+    const materialCostInput = document.getElementById('id_material_cost');
+    const suggestedTotalInput = document.getElementById('id_suggested_total');
+    const suggestedTotalDisplay = document.getElementById('chargeSuggestedTotalDisplay');
+
+    function updateSuggestedTotal() {
+      if (!laborCostInput || !materialCostInput || !suggestedTotalInput || !suggestedTotalDisplay) return;
+      const labor = parseFloat(laborCostInput.value || '0');
+      const material = parseFloat(materialCostInput.value || '0');
+      const total = (Number.isNaN(labor) ? 0 : labor) + (Number.isNaN(material) ? 0 : material);
+      suggestedTotalInput.value = total.toFixed(2);
+      suggestedTotalDisplay.textContent = `PHP ${total.toFixed(2)}`;
+    }
+
+    if (laborCostInput && materialCostInput) {
+      laborCostInput.addEventListener('input', updateSuggestedTotal);
+      materialCostInput.addEventListener('input', updateSuggestedTotal);
+      updateSuggestedTotal();
+    }
+  });
+</script>
+{% endblock %}
+

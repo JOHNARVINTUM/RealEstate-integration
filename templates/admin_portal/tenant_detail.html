@@ -1,0 +1,726 @@
+{% extends "admin_portal/base.html" %}
+{% load humanize %}
+{% block title %}{{ tenant.first_name }} {{ tenant.last_name }} | Tenant Portfolio{% endblock %}
+
+{% block extra_head %}
+<style>
+  .contract-table-stack {
+    box-sizing: border-box;
+    display: grid;
+    gap: 1rem;
+    width: 100%;
+    max-width: 100%;
+    padding: 1.25rem;
+  }
+
+  .contract-table-card {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid #e2e8f0;
+    border-radius: 0.75rem;
+  }
+
+  .contract-table {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    border-collapse: collapse;
+    table-layout: auto;
+  }
+
+  .contract-table thead tr {
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  .contract-table th {
+    padding: 0.75rem 1.25rem;
+    vertical-align: middle;
+    color: #94a3b8;
+    font-size: 0.625rem;
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    line-height: 1rem;
+    text-transform: uppercase;
+  }
+
+  .contract-table td {
+    padding: 0.75rem 1.25rem;
+    vertical-align: middle;
+    font-size: 0.875rem;
+    line-height: 1.25rem;
+  }
+
+  .contract-table tbody tr {
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  .contract-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="tenant-detail-wrapper max-w-7xl mx-auto font-sans text-slate-900 space-y-6 pb-12">
+  
+  <!-- Navigation: Simple Back Button -->
+  <nav class="flex items-center">
+    <a href="{{ back_url|default:'/admin-portal/tenants/' }}" onclick="if (document.referrer) { window.history.back(); return false; }" class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm font-extrabold text-slate-700 hover:bg-slate-50 transition-all shadow-xs group">
+      <svg class="w-5 h-5 text-slate-400 group-hover:text-slate-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7"></path>
+      </svg>
+      <span>Back</span>
+    </a>
+  </nav>
+
+  <!-- Profile Identity Administrative Ledger Card -->
+  <header class="bg-white/80 backdrop-blur-xl border border-white/40 rounded-[2rem] p-6 lg:p-8 shadow-sm flex flex-col md:flex-row items-center justify-between gap-6 relative overflow-hidden transition-all duration-500 hover:shadow-md">
+    <div class="flex flex-col sm:flex-row items-center gap-6 text-center sm:text-left w-full md:w-auto z-10">
+      <!-- Minimalist Robust Avatar -->
+      <div class="shrink-0 w-24 h-24 rounded-3xl bg-gradient-to-br from-slate-100 to-slate-200 border border-white shadow-inner flex items-center justify-center text-slate-700 text-3xl font-black">
+        {{ tenant.first_name|first }}{{ tenant.last_name|first }}
+      </div>
+      
+      <!-- Metadata Information -->
+      <div class="space-y-2">
+        <div class="flex flex-wrap items-center justify-center sm:justify-start gap-3">
+          <h1 class="text-3xl lg:text-4xl font-extrabold tracking-tight text-slate-900">{{ tenant.first_name }} {{ tenant.last_name }}</h1>
+          {% if tenant.user.is_active %}
+            <span class="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200/60 rounded-full text-xs font-black uppercase tracking-wider shadow-sm">
+              Active
+            </span>
+          {% else %}
+            <span class="inline-flex items-center gap-1.5 px-3 py-1 bg-slate-100 text-slate-600 border border-slate-200 rounded-full text-xs font-black uppercase tracking-wider shadow-sm">
+              Suspended
+            </span>
+          {% endif %}
+        </div>
+        
+        <div class="flex flex-col sm:flex-row items-center gap-3 sm:gap-5 text-sm text-slate-600 font-medium">
+          <span class="flex items-center gap-2 bg-white/60 px-3 py-1.5 rounded-full border border-slate-100">
+            <strong class="text-slate-800">{{ tenant.user.email }}</strong>
+          </span>
+          <span class="flex items-center gap-2 bg-white/60 px-3 py-1.5 rounded-full border border-slate-100">
+            <span class="text-slate-800">{{ tenant.contact_no|default:"No Phone Recorded" }}</span>
+          </span>
+          <span class="flex items-center gap-2 px-2 text-xs font-bold text-slate-400 uppercase tracking-widest">
+             Joined {{ tenant.user.date_joined|date:"M Y" }}
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Administrative Action Panel -->
+    <div class="flex items-center gap-3 shrink-0 w-full md:w-auto justify-center z-10">
+      <a href="{% url 'admin_edit_tenant' tenant.id %}" class="px-5 py-2.5 bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-300 rounded-full text-xs font-extrabold text-slate-800 transition-all shadow-sm hover:shadow-md flex items-center gap-2">
+        <span>Edit Profile</span>
+      </a>
+
+      <a href="{% url 'admin_delete_tenant' tenant.id %}" class="px-5 py-2.5 bg-rose-50 hover:bg-rose-600 border border-rose-100 hover:border-rose-600 rounded-full text-xs font-extrabold text-rose-700 hover:text-white transition-all shadow-sm hover:shadow-md hover:-translate-y-0.5 flex items-center gap-2">
+        <span>{% if tenant.has_records %}Deactivate{% else %}Delete{% endif %}</span>
+      </a>
+    </div>
+  </header>
+
+  <!-- Bento Grid Container -->
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+    <!-- Left Column: Stats & Leases -->
+    <div class="lg:col-span-4 space-y-6">
+      <!-- 2x2 Stats Bento -->
+      <section class="grid grid-cols-2 gap-4">
+        
+        <!-- Active Rooms -->
+        <div class="bg-white/80 backdrop-blur-md border border-white/40 border-l-4 border-l-blue-600 rounded-3xl p-5 shadow-sm transition-all duration-300 hover:shadow-lg hover:-translate-y-1">
+          <span class="text-xs font-bold text-slate-600 block mb-1">Active Rooms</span>
+          <strong class="text-2xl font-black text-slate-900 tracking-tight">{{ leases|length }}</strong>
+        </div>
+
+        <!-- Documents -->
+        <div class="bg-white/80 backdrop-blur-md border border-white/40 border-l-4 border-l-emerald-600 rounded-3xl p-5 shadow-sm transition-all duration-300 hover:shadow-lg hover:-translate-y-1">
+          <span class="text-xs font-bold text-slate-600 block mb-1">Documents</span>
+          <strong class="text-2xl font-black text-slate-900 tracking-tight">{{ attachments|length }}</strong>
+        </div>
+
+        <!-- Rent Amount -->
+        <div class="bg-white/80 backdrop-blur-md border border-white/40 border-l-4 border-l-purple-600 rounded-3xl p-5 shadow-sm transition-all duration-300 hover:shadow-lg hover:-translate-y-1">
+          <span class="text-xs font-bold text-slate-600 block mb-1">Rent Amount</span>
+          <strong class="text-2xl font-black text-slate-900 tracking-tight">
+            {% if display_lease %}
+              ₱{{ leases.0.monthly_rent|add:leases.0.parking_fee|floatformat:0|intcomma }}
+            {% else %}
+              ₱0
+            {% endif %}
+          </strong>
+        </div>
+
+        <!-- Contract Dates -->
+        <div class="bg-white/80 backdrop-blur-md border border-white/40 border-l-4 border-l-amber-600 rounded-3xl p-5 shadow-sm transition-all duration-300 hover:shadow-lg hover:-translate-y-1">
+          <span class="text-xs font-bold text-slate-600 block mb-1">Contract Dates</span>
+          <strong class="text-base font-black text-slate-900 tracking-tight block mt-1">
+            {% if display_lease %}
+              In: {{ display_lease.start_date|date:"M d, Y" }}
+              <span class="text-xs font-bold text-slate-500 block mt-1">
+                Out:
+                {% if display_lease.end_date %}
+                  {{ display_lease.end_date|date:"M d, Y" }}
+                {% else %}
+                  Open-ended
+                {% endif %}
+              </span>
+            {% else %}
+              N/A
+            {% endif %}
+          </strong>
+        </div>
+
+      </section>
+
+      <!-- Lease Portfolio Roster Section -->
+      <section class="bg-white/80 backdrop-blur-md border border-white/40 rounded-3xl shadow-sm overflow-hidden transition-all duration-500 hover:shadow-lg">
+        <div class="p-6 border-b border-slate-100/50 flex justify-between items-center">
+          <h2 class="text-base font-extrabold text-slate-900 tracking-tight">Room Details</h2>
+          <span class="text-xs font-bold text-slate-500">Active Rooms</span>
+        </div>
+
+        <div class="p-4 space-y-3">
+          <!-- Static Functional Instantiate Option -->
+          <div class="p-4 rounded-2xl border border-slate-200 bg-white shadow-2xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-lg bg-slate-100 border border-slate-300 flex items-center justify-center text-slate-800 font-extrabold text-base shrink-0">
+                +
+              </div>
+              <div>
+                <strong class="text-sm font-extrabold text-slate-900 block">Assign a New Room</strong>
+                <span class="text-xs text-slate-600">Pick a room for this tenant.</span>
+              </div>
+            </div>
+            
+            <a href="{% url 'admin_create_lease' %}?tenant_id={{ tenant.user.id }}" class="w-full sm:w-auto px-4 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-lg text-xs font-extrabold transition-colors text-center shrink-0">
+              Add Room
+            </a>
+          </div>
+
+          {% for l in leases %}
+            <div class="p-4 rounded-2xl border border-slate-100 bg-slate-50/40 shadow-2xs hover:border-slate-300 transition-all group flex flex-col gap-3">
+              <div class="flex justify-between items-start">
+                <div class="flex items-center gap-3">
+                  <div class="w-10 h-10 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-slate-700 shadow-inner font-bold text-xs">
+                    U{{ l.unit.number }}
+                  </div>
+                  <div>
+                    <strong class="text-sm font-extrabold text-slate-900 block">Room #{{ l.unit.number }}</strong>
+                    <span class="text-xs text-slate-500 font-medium">Started: {{ l.start_date|date:"M d, Y" }}</span>
+                  </div>
+                </div>
+                <a href="{% url 'admin_edit_lease' l.id %}" class="px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-100 text-slate-800 rounded-md text-xs font-bold transition-colors">
+                  Edit
+                </a>
+              </div>
+              <div class="flex justify-between items-center bg-white p-3 rounded-xl border border-slate-100">
+                <div>
+                  <span class="text-xs text-slate-500 block font-medium">Monthly Rent</span>
+                  <strong class="text-sm font-black text-slate-900">₱{{ l.monthly_rent|add:l.parking_fee|floatformat:0|intcomma }}</strong>
+                </div>
+                <div class="text-right">
+                  <span class="text-xs text-slate-500 block font-medium">Due Date</span>
+                  <strong class="text-sm font-black text-slate-900">Day {{ l.due_day }}</strong>
+                </div>
+              </div>
+            </div>
+          {% empty %}
+            <p class="text-xs text-slate-500 italic text-center py-6">No historical or active leasing associations cached.</p>
+          {% endfor %}
+        </div>
+      </section>
+    </div>
+
+    <!-- Right Column: Trust Score & Payments -->
+    <div class="lg:col-span-8 space-y-6">
+      
+      <!-- Premium Trust Score & Reliability Module -->
+      <!-- Made the glass effect dark -->
+      <section class="bg-slate-900/90 backdrop-blur-xl border border-slate-700 rounded-[2rem] shadow-lg overflow-hidden transition-all duration-500 hover:shadow-xl text-white">
+        <div class="p-5 border-b border-slate-800 flex justify-between items-center">
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-6 bg-white rounded-full"></div>
+            <h2 class="text-lg font-black tracking-tight text-white">Trust Score</h2>
+          </div>
+          <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Administrative Audit</span>
+        </div>
+
+        <div class="p-6">
+          {% with r=tenant.user.tenantriskclassification %}
+          {% if r %}
+            <div class="flex flex-col md:flex-row gap-8 items-stretch">
+              
+              <!-- Left Score Meter -->
+              <div class="md:w-[40%] flex flex-col items-center justify-center p-8 rounded-[2rem] bg-slate-800/50 border border-slate-700 relative overflow-hidden shadow-inner group">
+                
+                <span class="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400 mb-6 relative z-10">Overall Reliability</span>
+                
+                <!-- Circular Score Meter Concept -->
+                <div class="relative flex items-center justify-center mb-8 z-10">
+                  <svg class="w-36 h-36 transform -rotate-90">
+                    <circle cx="72" cy="72" r="64" stroke="currentColor" stroke-width="8" fill="transparent" class="text-slate-700" />
+                    <circle cx="72" cy="72" r="64" stroke="currentColor" stroke-width="8" fill="transparent" 
+                            stroke-dasharray="402" 
+                            style="stroke-dashoffset: calc(402 - (402 * {{ r.payment_score }}) / 100);"
+                            stroke-linecap="round"
+                            class="{% if r.payment_score >= 80 %}text-emerald-400{% elif r.payment_score >= 50 %}text-amber-400{% else %}text-rose-400{% endif %} transition-all duration-1500 ease-out" />
+                  </svg>
+                  <div class="absolute inset-0 flex flex-col items-center justify-center text-white">
+                    <span class="text-5xl font-black tracking-tighter tabular-nums">{{ r.payment_score }}</span>
+                    <span class="text-[10px] font-bold text-slate-400 uppercase">Points</span>
+                  </div>
+                </div>
+
+                <div class="relative z-10">
+                  {% if r.risk_level == 'LOW' %}
+                    <div class="px-4 py-1.5 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-full text-xs font-black uppercase tracking-wider flex items-center gap-2">
+                      Highly Reliable
+                    </div>
+                  {% elif r.risk_level == 'MEDIUM' %}
+                    <div class="px-4 py-1.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-full text-xs font-black uppercase tracking-wider flex items-center gap-2">
+                      Standard Risk
+                    </div>
+                  {% else %}
+                    <div class="px-4 py-1.5 bg-rose-500/10 border border-rose-500/20 text-rose-400 rounded-full text-xs font-black uppercase tracking-wider flex items-center gap-2">
+                      High Caution
+                    </div>
+                  {% endif %}
+                </div>
+              </div>
+
+              <!-- Right Breakdown (Detailed Metrics) -->
+              <div class="flex-1 flex flex-col justify-between space-y-6">
+                <!-- Status Row -->
+                <div class="grid grid-cols-2 gap-4 h-full">
+                  <div class="p-5 rounded-2xl border border-slate-700 bg-slate-800/50 shadow-sm hover:border-slate-600 transition-all flex flex-col justify-center">
+                    <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-3">Late Payments</span>
+                    <div class="flex items-end gap-2">
+                      <span class="text-3xl font-black {% if r.late_payment_count > 0 %}text-amber-400{% else %}text-white{% endif %}">{{ r.late_payment_count }}</span>
+                      <span class="text-xs font-bold text-slate-400 mb-1.5">Occurrences</span>
+                    </div>
+                  </div>
+                  <div class="p-5 rounded-2xl border border-slate-700 bg-slate-800/50 shadow-sm hover:border-slate-600 transition-all flex flex-col justify-center">
+                    <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-3">Unpaid Bills</span>
+                    <div class="flex items-end gap-2">
+                      <span class="text-3xl font-black {% if r.unpaid_bill_count > 0 %}text-rose-400{% else %}text-white{% endif %}">{{ r.unpaid_bill_count }}</span>
+                      <span class="text-xs font-bold text-slate-400 mb-1.5">Open Items</span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Technical Factors (Compact) -->
+                <div class="bg-slate-800/50 rounded-2xl border border-slate-700 p-6 shadow-sm">
+                  <h3 class="text-xs font-black text-white uppercase tracking-widest mb-5">
+                    Score Components
+                  </h3>
+                  <div class="grid grid-cols-1 sm:grid-cols-2 gap-y-4 gap-x-8">
+                    {% if r.risk_factors %}
+                      <div class="space-y-1">
+                        <div class="flex justify-between text-[11px] font-bold text-slate-400 uppercase">
+                          <span>Timeliness</span>
+                          <span class="text-white">{{ r.payment_timeliness_factor }}%</span>
+                        </div>
+                        <div class="w-full bg-slate-700 h-1 rounded-full overflow-hidden"><div class="h-full bg-slate-300" style="width: {{ r.payment_timeliness_factor }}%"></div></div>
+                        <p class="text-[10px] font-bold text-slate-500">40% weight = {{ r.payment_timeliness_points }} pts</p>
+                      </div>
+                      <div class="space-y-1">
+                        <div class="flex justify-between text-[11px] font-bold text-slate-400 uppercase">
+                          <span>Consistency</span>
+                          <span class="text-white">{{ r.payment_consistency_factor }}%</span>
+                        </div>
+                        <div class="w-full bg-slate-700 h-1 rounded-full overflow-hidden"><div class="h-full bg-slate-300" style="width: {{ r.payment_consistency_factor }}%"></div></div>
+                        <p class="text-[10px] font-bold text-slate-500">30% weight = {{ r.payment_consistency_points }} pts</p>
+                      </div>
+                      <div class="space-y-1">
+                        <div class="flex justify-between text-[11px] font-bold text-slate-400 uppercase">
+                          <span>Status Vector</span>
+                          <span class="text-white">{{ r.current_payment_status_factor }}%</span>
+                        </div>
+                        <div class="w-full bg-slate-700 h-1 rounded-full overflow-hidden"><div class="h-full bg-slate-300" style="width: {{ r.current_payment_status_factor }}%"></div></div>
+                        <p class="text-[10px] font-bold text-slate-500">20% weight = {{ r.current_payment_status_points }} pts</p>
+                      </div>
+                      <div class="space-y-1">
+                        <div class="flex justify-between text-[11px] font-bold text-slate-400 uppercase">
+                          <span>Approval Rate</span>
+                          <span class="text-white">{{ r.payment_method_reliability_factor }}%</span>
+                        </div>
+                        <div class="w-full bg-slate-700 h-1 rounded-full overflow-hidden"><div class="h-full bg-slate-300" style="width: {{ r.payment_method_reliability_factor }}%"></div></div>
+                        <p class="text-[10px] font-bold text-slate-500">10% weight = {{ r.payment_method_reliability_points }} pts</p>
+                      </div>
+                    {% else %}
+                      <p class="text-xs text-slate-400 italic col-span-2">Factor analysis currently unavailable.</p>
+                    {% endif %}
+                  </div>
+                  {% if r.risk_factors %}
+                    <div class="mt-5 pt-4 border-t border-slate-700">
+                      <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">How {{ r.payment_score }} Was Computed</p>
+                      <p class="text-xs font-bold text-slate-300 leading-6">
+                        {{ r.payment_score }} = ({{ r.payment_timeliness_factor }} x 40%) + ({{ r.payment_consistency_factor }} x 30%) + ({{ r.current_payment_status_factor }} x 20%) + ({{ r.payment_method_reliability_factor }} x 10%)
+                      </p>
+                      <p class="text-[11px] font-bold text-slate-500 mt-1">
+                        = {{ r.payment_timeliness_points }} + {{ r.payment_consistency_points }} + {{ r.current_payment_status_points }} + {{ r.payment_method_reliability_points }} points
+                      </p>
+                    </div>
+                  {% endif %}
+                </div>
+              </div>
+
+            </div>
+          {% else %}
+            <div class="py-12 flex flex-col items-center justify-center text-center">
+              <div class="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center mb-4 text-slate-500">
+              </div>
+              <p class="text-sm font-bold text-white">No Trust Profile Detected</p>
+              <p class="text-xs text-slate-400 max-w-[240px] mt-1">This tenant hasn't made enough payments yet to generate a reliability score.</p>
+            </div>
+          {% endif %}
+          {% endwith %}
+        </div>
+      </section>
+
+      <!-- Contract Ledger Bento Module -->
+      <section class="bg-white/80 backdrop-blur-md border border-white/40 rounded-[2rem] shadow-sm overflow-hidden transition-all duration-500 hover:shadow-lg">
+        
+        <!-- Header & Segment Control -->
+        <div class="p-5 border-b border-slate-100/50 flex flex-col sm:flex-row justify-between items-center gap-4">
+          <div>
+            <h2 class="text-base font-extrabold text-slate-900 tracking-tight">Contract Ledger</h2>
+            <p class="text-xs font-bold text-slate-500 mt-1">All contract months, paid status, and upcoming billing cycles.</p>
+          </div>
+          
+          <div class="grid w-full sm:w-[320px] {% if manual_payments %}grid-cols-2{% else %}grid-cols-1{% endif %} items-center gap-1 p-1 bg-slate-100 rounded-lg">
+            <button onclick="togglePaymentSection('history')" id="btn-payment-history" class="w-full px-4 py-2 text-sm font-extrabold rounded-md transition-all bg-white text-slate-900 shadow-sm">Contract Ledger</button>
+            {% if manual_payments %}
+            <button onclick="togglePaymentSection('submissions')" id="btn-payment-submissions" class="w-full px-4 py-2 text-sm font-bold rounded-md transition-all text-slate-600 hover:text-slate-900">Payment Submissions</button>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- History Table -->
+        <div id="payment-history-section" class="w-full transition-all duration-500">
+          <div class="contract-table-stack">
+            {% if contract_events %}
+            <div class="w-full max-w-full">
+              <p class="mb-3 text-[10px] font-black uppercase tracking-widest text-slate-400">Confirmed contract events</p>
+              <div class="contract-table-card">
+                <table class="contract-table">
+                <thead>
+                  <tr class="bg-slate-50/30 border-b border-slate-100">
+                    <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Event</th>
+                    <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Confirmed</th>
+                    <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Unit</th>
+                    <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Reference</th>
+                    <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Method</th>
+                    <th class="text-right px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Amount</th>
+                    <th class="text-center px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Status</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                  {% for event in contract_events %}
+                  <tr class="hover:bg-slate-50/50 transition-colors">
+                    <td class="px-5 py-3 font-bold text-slate-800">Move-in Payment</td>
+                    <td class="px-5 py-3 text-slate-600 font-medium whitespace-nowrap">
+                      {{ event.occurred_at|date:"M d, Y" }}
+                      {% if event.legacy_derived %}<span class="ml-1 text-[10px] text-slate-400">legacy-derived</span>{% endif %}
+                    </td>
+                    <td class="px-5 py-3 text-slate-600 font-medium">#{{ event.lease.unit.number }}</td>
+                    <td class="px-5 py-3 text-slate-500 font-mono text-xs">{{ event.payment_reference|default:"—" }}</td>
+                    <td class="px-5 py-3 text-slate-600 font-medium">{{ event.payment_method }}</td>
+                    <td class="px-5 py-3 text-right font-black text-slate-900">₱{{ event.amount|floatformat:2|intcomma }}</td>
+                    <td class="px-5 py-3 text-center"><span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-emerald-50 text-emerald-700 border border-emerald-200">APPROVED</span></td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+                </table>
+              </div>
+            </div>
+            {% endif %}
+            <div class="contract-table-card">
+              <table class="contract-table" id="paymentHistoryTable">
+              <thead>
+                <tr class="bg-slate-50/30 border-b border-slate-100">
+                  <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Month</th>
+                  <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Unit</th>
+                  <th class="text-right px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Rent</th>
+                  <th class="text-right px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Water</th>
+                  <th class="text-right px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Parking</th>
+                  <th class="text-right px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Total</th>
+                  <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Payment Method</th>
+                  <th class="text-center px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Status</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100" id="paymentHistoryBody">
+                {% for bill in bill_history %}
+                <tr class="hover:bg-slate-50/50 transition-colors">
+                  <td class="px-5 py-3 font-bold text-slate-800 whitespace-nowrap">{{ bill.billing_month|date:"M Y" }}</td>
+                  <td class="px-5 py-3 text-slate-600 font-medium">#{{ bill.lease.unit.number }}</td>
+                  <td class="px-5 py-3 text-right font-bold text-slate-800">₱{{ bill.base_rent|floatformat:0|intcomma }}</td>
+                  <td class="px-5 py-3 text-right font-medium text-slate-600">
+                    {% if bill.water_amount %}₱{{ bill.water_amount|floatformat:0|intcomma }}{% else %}—{% endif %}
+                  </td>
+                  <td class="px-5 py-3 text-right font-medium {% if bill.parking_fee %}text-amber-700{% else %}text-slate-400{% endif %}">
+                    {% if bill.parking_fee %}₱{{ bill.parking_fee|floatformat:0|intcomma }}{% else %}—{% endif %}
+                  </td>
+                  <td class="px-5 py-3 text-right font-black text-slate-900">
+                    ₱{{ bill.base_rent|add:bill.water_amount|add:bill.parking_fee|add:bill.interest|floatformat:0|intcomma }}
+                  </td>
+                  <td class="px-5 py-3 text-left text-slate-700 font-medium">
+                    {% if bill.payment_method_label %}
+                      <span class="whitespace-nowrap">{{ bill.payment_method_label }}</span>
+                      {% if bill.payment_method_provider %}<span class="block text-xs text-slate-500">{{ bill.payment_method_provider }}</span>{% endif %}
+                      {% if bill.status == "PARTIALLY_PAID" %}<span class="block text-xs text-amber-700">Partial payment</span>{% endif %}
+                    {% else %}
+                      <span class="text-slate-400">—</span>
+                    {% endif %}
+                  </td>
+                  <td class="px-5 py-3 text-center">
+                    {% if bill.status == "PAID" %}
+                      <span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-emerald-50 text-emerald-700 border border-emerald-200">PAID</span>
+                    {% elif bill.status == "PARTIALLY_PAID" %}
+                      <span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-amber-50 text-amber-700 border border-amber-200">PARTIAL</span>
+                    {% elif bill.billing_state == "UPCOMING" %}
+                      <span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-yellow-50 text-yellow-700 border border-yellow-200">UPCOMING</span>
+                    {% elif bill.billing_state == "OVERDUE" %}
+                      <span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-rose-50 text-rose-700 border border-rose-200">OVERDUE</span>
+                    {% else %}
+                      <span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-sky-50 text-sky-700 border border-sky-200">DUE</span>
+                    {% endif %}
+                  </td>
+                </tr>
+                {% empty %}
+                <tr>
+                  <td colspan="8" class="px-5 py-8 text-center text-xs text-slate-500 italic">No billing records found.</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+              </table>
+            </div>
+          </div>
+          <div id="paymentHistoryControls" class="px-5 pb-5"></div>
+        </div>
+
+        <!-- Submissions Table -->
+        {% if manual_payments %}
+        <div id="payment-submissions-section" class="w-full hidden transition-all duration-500">
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm" id="paymentSubmissionsTable">
+              <thead>
+                <tr class="bg-slate-50/30 border-b border-slate-100">
+                  <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Date</th>
+                  <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Method</th>
+                  <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Type</th>
+                  <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Covered Month</th>
+                  <th class="text-left px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Reference</th>
+                  <th class="text-right px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Amount</th>
+                  <th class="text-center px-5 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Status</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100" id="paymentSubmissionsBody">
+                {% for mp in manual_payments %}
+                <tr class="hover:bg-slate-50/50 transition-colors">
+                  <td class="px-5 py-3 font-bold text-slate-800 whitespace-nowrap">{{ mp.created_at|date:"M d, Y" }}</td>
+                  <td class="px-5 py-3 text-slate-600 font-medium">{{ mp.get_payment_method_display }}</td>
+                  <td class="px-5 py-3 text-slate-600 font-medium">{{ mp.get_payment_type_display }}</td>
+                  <td class="px-5 py-3 text-slate-600 font-bold whitespace-nowrap">{{ mp.covered_months }}</td>
+                  <td class="px-5 py-3 text-slate-500 font-mono text-xs">{{ mp.reference_code|default:"—" }}</td>
+                  <td class="px-5 py-3 text-right font-black text-slate-900">₱{{ mp.amount|floatformat:0|intcomma }}</td>
+                  <td class="px-5 py-3 text-center">
+                    {% if mp.status == "APPROVED" %}
+                      <span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-emerald-50 text-emerald-700 border border-emerald-200">APPROVED</span>
+                    {% elif mp.status == "PENDING" %}
+                      <span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-amber-50 text-amber-700 border border-amber-200">FOR APPROVAL</span>
+                    {% else %}
+                      <span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black bg-rose-50 text-rose-700 border border-rose-200">REJECTED</span>
+                    {% endif %}
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div id="paymentSubmissionsControls"></div>
+        </div>
+        {% endif %}
+
+      </section>
+
+    </div>
+
+    <!-- Bottom Row: Document Vault (Full Width) -->
+    <div class="lg:col-span-12">
+      <section class="bg-white/80 backdrop-blur-md border border-white/40 rounded-[2rem] shadow-sm overflow-hidden transition-all duration-500 hover:shadow-lg">
+        <div class="p-5 border-b border-slate-100/50 flex justify-between items-center">
+          <h2 class="text-base font-extrabold text-slate-900 tracking-tight">Documents</h2>
+          <span class="text-xs font-bold text-slate-500">{{ attachments|length }} Items</span>
+        </div>
+
+        <div class="p-5">
+          <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-4">
+            {% for attachment in attachments %}
+              <div class="border border-slate-200 rounded-lg p-3 bg-white shadow-2xs flex flex-col justify-between gap-3">
+                
+                <div class="flex justify-between items-start gap-2">
+                  <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px] font-black uppercase tracking-wider border border-slate-200">
+                    {{ attachment.get_attachment_type_display }}
+                  </span>
+
+                  <div class="flex items-center gap-1 shrink-0">
+                    <a href="{% url 'admin_view_attachment' attachment.id %}" target="_blank" class="p-1 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded transition-colors" title="View Document">
+                      <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+                      </svg>
+                    </a>
+                    
+                    <a href="{% url 'admin_delete_attachment' attachment.id %}" class="inline-block p-1 bg-slate-100 hover:bg-rose-50 text-rose-700 rounded transition-colors" title="Delete Document">
+                      <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                      </svg>
+                    </a>
+                  </div>
+                </div>
+
+                <!-- Preview Area -->
+                <div class="h-28 bg-slate-50 rounded border border-slate-100 flex items-center justify-center overflow-hidden relative">
+                  {% if attachment.is_image %}
+                    <img src="{% url 'admin_view_attachment' attachment.id %}" class="w-full h-full object-cover" alt="{{ attachment.filename }}">
+                  {% else %}
+                    <div class="text-center p-2">
+                      <span class="text-xs font-black text-slate-400 block uppercase">{{ attachment.file_extension|cut:"." }}</span>
+                      <span class="text-[10px] text-slate-500 block">Secured Binary</span>
+                    </div>
+                  {% endif %}
+                </div>
+
+                <!-- Footer Descriptor -->
+                <div>
+                  <strong class="text-xs font-bold text-slate-900 block truncate" title="{{ attachment.filename }}">{{ attachment.filename }}</strong>
+                  <div class="flex justify-between items-center text-[10px] text-slate-500 mt-1 font-medium">
+                    <span>{{ attachment.get_file_size_display }}</span>
+                    <span>{{ attachment.uploaded_at|date:"M d, Y" }}</span>
+                  </div>
+                </div>
+
+              </div>
+            {% empty %}
+              <p class="col-span-full text-xs text-slate-500 italic text-center py-6">No cached vault objects associated.</p>
+            {% endfor %}
+          </div>
+        </div>
+      </section>
+    </div>
+
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Same pagination script as before
+document.addEventListener("DOMContentLoaded", function() {
+    function setupPagination(tbodyId, controlsId, itemsPerPage = 5) {
+        const tbody = document.getElementById(tbodyId);
+        if (!tbody) return;
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        
+        if (rows.length === 0 || (rows.length === 1 && rows[0].cells.length === 1)) return;
+
+        const totalPages = Math.ceil(rows.length / itemsPerPage);
+        if (totalPages <= 1) return;
+
+        const controlsContainer = document.getElementById(controlsId);
+        if (!controlsContainer) return;
+
+        let currentPage = 1;
+
+        function renderTable() {
+            const start = (currentPage - 1) * itemsPerPage;
+            const end = start + itemsPerPage;
+            rows.forEach((row, index) => {
+                row.style.display = (index >= start && index < end) ? '' : 'none';
+            });
+        }
+
+        function renderControls() {
+            controlsContainer.innerHTML = '';
+            
+            const wrapper = document.createElement('div');
+            wrapper.className = 'flex items-center justify-between px-5 py-3 bg-white border-t border-slate-100 rounded-b-[2rem]';
+            
+            const info = document.createElement('div');
+            info.className = 'text-xs text-slate-500 font-medium';
+            info.textContent = `Showing ${(currentPage - 1) * itemsPerPage + 1} to ${Math.min(currentPage * itemsPerPage, rows.length)} of ${rows.length} entries`;
+            
+            const buttons = document.createElement('div');
+            buttons.className = 'flex items-center gap-1';
+            
+            const prevBtn = document.createElement('button');
+            prevBtn.className = `px-3 py-1 rounded text-xs font-bold border ${currentPage === 1 ? 'bg-slate-50 text-slate-400 border-slate-200 cursor-not-allowed' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50 transition-colors'}`;
+            prevBtn.textContent = 'Prev';
+            prevBtn.disabled = currentPage === 1;
+            prevBtn.onclick = () => { if (currentPage > 1) { currentPage--; update(); } };
+            
+            const nextBtn = document.createElement('button');
+            nextBtn.className = `px-3 py-1 rounded text-xs font-bold border ${currentPage === totalPages ? 'bg-slate-50 text-slate-400 border-slate-200 cursor-not-allowed' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50 transition-colors'}`;
+            nextBtn.textContent = 'Next';
+            nextBtn.disabled = currentPage === totalPages;
+            nextBtn.onclick = () => { if (currentPage < totalPages) { currentPage++; update(); } };
+            
+            buttons.appendChild(prevBtn);
+            
+            for (let i = 1; i <= totalPages; i++) {
+                const pageBtn = document.createElement('button');
+                pageBtn.className = `w-7 h-7 flex items-center justify-center rounded text-xs font-bold border transition-colors ${currentPage === i ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'}`;
+                pageBtn.textContent = i;
+                pageBtn.onclick = () => { currentPage = i; update(); };
+                buttons.appendChild(pageBtn);
+            }
+            
+            buttons.appendChild(nextBtn);
+            
+            wrapper.appendChild(info);
+            wrapper.appendChild(buttons);
+            controlsContainer.appendChild(wrapper);
+        }
+
+        function update() {
+            renderTable();
+            renderControls();
+        }
+
+        update();
+    }
+
+    setupPagination('paymentHistoryBody', 'paymentHistoryControls', 5);
+    setupPagination('paymentSubmissionsBody', 'paymentSubmissionsControls', 5);
+});
+
+function togglePaymentSection(section) {
+    const historySection = document.getElementById('payment-history-section');
+    const submissionsSection = document.getElementById('payment-submissions-section');
+    const btnHistory = document.getElementById('btn-payment-history');
+    const btnSubmissions = document.getElementById('btn-payment-submissions');
+
+    if (section === 'history') {
+        historySection.classList.remove('hidden');
+        if (submissionsSection) submissionsSection.classList.add('hidden');
+        
+        btnHistory.className = "px-4 py-2 text-sm font-extrabold rounded-md transition-all bg-white text-slate-900 shadow-sm";
+        if (btnSubmissions) btnSubmissions.className = "px-4 py-2 text-sm font-bold rounded-md transition-all text-slate-600 hover:text-slate-900";
+    } else {
+        historySection.classList.add('hidden');
+        if (submissionsSection) submissionsSection.classList.remove('hidden');
+        
+        btnHistory.className = "px-4 py-2 text-sm font-bold rounded-md transition-all text-slate-600 hover:text-slate-900";
+        if (btnSubmissions) btnSubmissions.className = "px-4 py-2 text-sm font-extrabold rounded-md transition-all bg-white text-slate-900 shadow-sm";
+    }
+}
+</script>
+{% endblock %}
